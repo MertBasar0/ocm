@@ -1,6 +1,6 @@
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -100,7 +100,7 @@ fn install_fake_node_and_packing_npm(
     let log_path = root.child("fake-pack-npm.log");
     write_executable_script(
         &bin_dir.join("node"),
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'v22.22.3\\n'\n  exit 0\nfi\nif [ \"$(basename \"$1\")\" = \"ocm-npm-workspace-deps.mjs\" ]; then\n  script=\"$1\"\n  shift\n  exec \"$script\" \"$@\"\nfi\nprintf 'fake node\\n'\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf 'v22.22.3\\n'\n  exit 0\nfi\ncase \"$(basename \"$1\")\" in\n  ocm-npm-workspace-deps.mjs|ocm-npm-workspace-deps.mts)\n    script=\"$1\"\n    shift\n    exec \"$script\" \"$@\"\n    ;;\nesac\nprintf 'fake node\\n'\n",
     );
     let npm_script = format!(
         r#"#!/bin/sh
@@ -113,6 +113,8 @@ fi
 if [ "$1" = "pack" ]; then
   printf 'verify-deps-before-run=%s\n' "$PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN" >> "{}"
   printf 'allow-unreleased-changelog=%s\n' "$OPENCLAW_PREPACK_ALLOW_UNRELEASED_CHANGELOG" >> "{}"
+  printf 'ignore-scripts-lower=%s\n' "${{npm_config_ignore_scripts-unset}}" >> "{}"
+  printf 'ignore-scripts-upper=%s\n' "${{NPM_CONFIG_IGNORE_SCRIPTS-unset}}" >> "{}"
   shift
   destination=""
   while [ "$#" -gt 0 ]; do
@@ -167,6 +169,8 @@ if grep -q '"chokidar"' "$prefix/node_modules/openclaw/package.json"; then
   printf '{{"name":"@scope/tool","version":"1.0.0"}}\n' > "$prefix/node_modules/@scope/tool/package.json"
 fi
 "#,
+        path_string(&log_path),
+        path_string(&log_path),
         path_string(&log_path),
         path_string(&log_path),
         path_string(&log_path),
@@ -468,6 +472,8 @@ fn runtime_build_local_packs_and_installs_release_shaped_package() {
     .unwrap();
 
     let mut env = ocm_env(&root);
+    env.insert("npm_config_ignore_scripts".to_string(), "true".to_string());
+    env.insert("NPM_CONFIG_IGNORE_SCRIPTS".to_string(), "true".to_string());
     let npm_log = install_fake_node_and_packing_npm(&root, &mut env, &archive_path);
 
     let build = run_ocm(
@@ -489,6 +495,8 @@ fn runtime_build_local_packs_and_installs_release_shaped_package() {
     assert!(npm_log.contains("pack --pack-destination"));
     assert!(npm_log.contains("verify-deps-before-run=false"));
     assert!(npm_log.contains("allow-unreleased-changelog=1"));
+    assert!(npm_log.contains("ignore-scripts-lower=false"));
+    assert!(npm_log.contains("ignore-scripts-upper=unset"));
     assert!(npm_log.contains("install --prefix"));
 
     let install_root = runtime_install_root("main-local", &env, &cwd).unwrap();
@@ -559,14 +567,25 @@ fn runtime_build_local_rejects_a_bound_runtime_before_repo_validation() {
     assert!(!error.contains("repo path does not exist"), "{error}");
 }
 
-#[test]
-fn runtime_build_local_uses_repo_workspace_dependency_adapter() {
-    let root = TestDir::new("runtime-build-local-workspace-adapter");
+fn assert_runtime_build_local_uses_repo_workspace_dependency_adapter(
+    adapter_extension: &str,
+    include_legacy_adapter: bool,
+) {
+    let root = TestDir::new(&format!(
+        "runtime-build-local-workspace-adapter-{adapter_extension}"
+    ));
     let cwd = root.child("workspace");
     let repo = cwd.join("openclaw");
-    let workspace_dependency = repo.join("packages/ai");
+    let workspace_dependencies = [
+        repo.join("packages/ai"),
+        repo.join("packages/normalization-core"),
+        repo.join("packages/session-url-contract"),
+        repo.join("packages/gateway-protocol"),
+    ];
     fs::create_dir_all(repo.join("scripts")).unwrap();
-    fs::create_dir_all(&workspace_dependency).unwrap();
+    for package_dir in &workspace_dependencies {
+        fs::create_dir_all(package_dir).unwrap();
+    }
     fs::write(
         repo.join("pnpm-workspace.yaml"),
         "packages:\n  - .\n  - packages/*\n",
@@ -578,16 +597,34 @@ fn runtime_build_local_uses_repo_workspace_dependency_adapter() {
     )
     .unwrap();
     fs::write(
-        workspace_dependency.join("package.json"),
-        br#"{"name":"@openclaw/ai","version":"2026.4.25"}"#,
+        workspace_dependencies[0].join("package.json"),
+        br#"{"name":"@openclaw/ai","version":"2026.4.25","optionalDependencies":{"@openclaw/normalization-core":"workspace:*"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace_dependencies[1].join("package.json"),
+        br#"{"name":"@openclaw/normalization-core","version":"0.0.0-private","peerDependencies":{"@openclaw/session-url-contract":"workspace:^"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace_dependencies[2].join("package.json"),
+        br#"{"name":"@openclaw/session-url-contract","version":"0.0.0-private","devDependencies":{"@openclaw/gateway-protocol":"workspace:~"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace_dependencies[3].join("package.json"),
+        br#"{"name":"@openclaw/gateway-protocol","version":"0.0.0-private","dependencies":{"@openclaw/ai":"workspace:*","openclaw":"workspace:*"}}"#,
     )
     .unwrap();
 
     let adapter_log = root.child("workspace-adapter.log");
     write_executable_script(
-        &repo.join("scripts/ocm-npm-workspace-deps.mjs"),
+        &repo.join(format!(
+            "scripts/ocm-npm-workspace-deps.{adapter_extension}"
+        )),
         &format!(
             r#"#!/bin/sh
+printf 'adapter={adapter_extension}\n' >> "{}"
 printf 'args=%s\n' "$*" >> "{}"
 printf 'real-npm=%s\n' "$OPENCLAW_OCM_REAL_NPM_BIN" >> "{}"
 printf 'workspace-dirs=%s\n' "$OPENCLAW_OCM_WORKSPACE_DEPENDENCY_DIRS" >> "{}"
@@ -596,8 +633,18 @@ exec "$OPENCLAW_OCM_REAL_NPM_BIN" "$@"
             path_string(&adapter_log),
             path_string(&adapter_log),
             path_string(&adapter_log),
+            path_string(&adapter_log),
         ),
     );
+    if include_legacy_adapter {
+        write_executable_script(
+            &repo.join("scripts/ocm-npm-workspace-deps.mjs"),
+            &format!(
+                "#!/bin/sh\nprintf 'adapter=mjs\\n' >> \"{}\"\nexit 1\n",
+                path_string(&adapter_log)
+            ),
+        );
+    }
 
     let archive_path = root.child("packed-openclaw.tgz");
     fs::write(
@@ -629,10 +676,88 @@ exec "$OPENCLAW_OCM_REAL_NPM_BIN" "$@"
     assert!(adapter_log.contains("args=pack --pack-destination"));
     assert!(adapter_log.contains("args=install --prefix"));
     assert!(adapter_log.contains("real-npm=npm"));
-    assert!(adapter_log.contains(&format!(
-        "workspace-dirs={}",
-        path_string(&fs::canonicalize(workspace_dependency).unwrap())
-    )));
+    assert!(adapter_log.contains(&format!("adapter={adapter_extension}")));
+    if include_legacy_adapter {
+        assert!(!adapter_log.contains("adapter=mjs"));
+    }
+    let expected_dirs = workspace_dependencies
+        .into_iter()
+        .map(|package_dir| fs::canonicalize(package_dir).unwrap())
+        .collect::<BTreeSet<_>>();
+    let workspace_dir_values = adapter_log
+        .lines()
+        .filter_map(|line| line.strip_prefix("workspace-dirs="))
+        .collect::<Vec<_>>();
+    assert_eq!(workspace_dir_values.len(), 2, "{adapter_log}");
+    for value in workspace_dir_values {
+        assert_eq!(
+            std::env::split_paths(value).collect::<BTreeSet<_>>(),
+            expected_dirs,
+            "{adapter_log}"
+        );
+    }
+}
+
+#[test]
+fn runtime_build_local_prefers_current_mts_workspace_dependency_adapter() {
+    assert_runtime_build_local_uses_repo_workspace_dependency_adapter("mts", true);
+}
+
+#[test]
+fn runtime_build_local_keeps_legacy_mjs_workspace_dependency_adapter() {
+    assert_runtime_build_local_uses_repo_workspace_dependency_adapter("mjs", false);
+}
+
+#[test]
+fn runtime_build_local_rejects_a_missing_transitive_workspace_dependency() {
+    let root = TestDir::new("runtime-build-local-missing-transitive-workspace");
+    let cwd = root.child("workspace");
+    let repo = cwd.join("openclaw");
+    let workspace_dependency = repo.join("packages/ai");
+    fs::create_dir_all(repo.join("scripts")).unwrap();
+    fs::create_dir_all(&workspace_dependency).unwrap();
+    fs::write(
+        repo.join("pnpm-workspace.yaml"),
+        "packages:\n  - .\n  - packages/*\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("package.json"),
+        br#"{"name":"openclaw","version":"2026.4.25","bin":{"openclaw":"openclaw.mjs"},"dependencies":{"@openclaw/ai":"workspace:*"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace_dependency.join("package.json"),
+        br#"{"name":"@openclaw/ai","version":"2026.4.25","dependencies":{"@openclaw/missing":"workspace:*"}}"#,
+    )
+    .unwrap();
+    write_executable_script(
+        &repo.join("scripts/ocm-npm-workspace-deps.mts"),
+        "#!/bin/sh\nexit 0\n",
+    );
+
+    let env = ocm_env(&root);
+    let build = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "build-local",
+            "main-workspace",
+            "--repo",
+            "./openclaw",
+            "--raw",
+        ],
+    );
+
+    assert_eq!(build.status.code(), Some(1));
+    assert!(
+        stderr(&build).contains(
+            "OpenClaw workspace dependency \"@openclaw/missing\" is not declared by pnpm-workspace.yaml"
+        ),
+        "{}",
+        stderr(&build)
+    );
 }
 
 #[test]

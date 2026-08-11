@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 #[cfg(unix)]
@@ -435,22 +435,8 @@ fn local_workspace_package_dirs(repo_path: &Path) -> Result<Vec<PathBuf>, String
     Ok(dirs)
 }
 
-fn local_workspace_dependency_dirs(repo_path: &Path) -> Result<Option<OsString>, String> {
-    let package_json_path = repo_path.join("package.json");
-    let raw = fs::read_to_string(&package_json_path).map_err(|error| {
-        format!(
-            "failed to read OpenClaw package.json at {}: {error}",
-            display_path(&package_json_path)
-        )
-    })?;
-    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
-        format!(
-            "failed to parse OpenClaw package.json at {}: {error}",
-            display_path(&package_json_path)
-        )
-    })?;
-
-    let mut names = Vec::new();
+fn workspace_dependency_names(value: &serde_json::Value) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
     for section in [
         "dependencies",
         "optionalDependencies",
@@ -465,15 +451,38 @@ fn local_workspace_dependency_dirs(repo_path: &Path) -> Result<Option<OsString>,
                 .as_str()
                 .is_some_and(|value| value.starts_with("workspace:"))
             {
-                names.push(name.clone());
+                names.insert(name.clone());
             }
         }
     }
-    names.sort();
-    names.dedup();
-    if names.is_empty() {
+    names
+}
+
+fn local_workspace_dependency_dirs(repo_path: &Path) -> Result<Option<OsString>, String> {
+    let package_json_path = repo_path.join("package.json");
+    let raw = fs::read_to_string(&package_json_path).map_err(|error| {
+        format!(
+            "failed to read OpenClaw package.json at {}: {error}",
+            display_path(&package_json_path)
+        )
+    })?;
+    let root_package: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "failed to parse OpenClaw package.json at {}: {error}",
+            display_path(&package_json_path)
+        )
+    })?;
+
+    let mut pending = workspace_dependency_names(&root_package);
+    if pending.is_empty() {
         return Ok(None);
     }
+    let mut visited = root_package
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
 
     let mut packages = BTreeMap::new();
     for package_dir in local_workspace_package_dirs(repo_path)? {
@@ -492,21 +501,25 @@ fn local_workspace_dependency_dirs(repo_path: &Path) -> Result<Option<OsString>,
             .get("name")
             .and_then(serde_json::Value::as_str)
         {
-            packages.insert(name.to_string(), package_dir);
+            packages.insert(name.to_string(), (package_dir, package_value));
         }
     }
 
-    let dirs = names
-        .into_iter()
-        .map(|name| {
-            packages.remove(&name).ok_or_else(|| {
-                format!(
-                    "OpenClaw workspace dependency \"{name}\" is not declared by pnpm-workspace.yaml"
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    std::env::join_paths(dirs)
+    let mut selected = BTreeMap::new();
+    while let Some(name) = pending.pop_first() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let (package_dir, package_value) = packages.get(&name).ok_or_else(|| {
+            format!(
+                "OpenClaw workspace dependency \"{name}\" is not declared by pnpm-workspace.yaml"
+            )
+        })?;
+        selected.insert(name, package_dir.clone());
+        pending.extend(workspace_dependency_names(package_value));
+    }
+
+    std::env::join_paths(selected.into_values())
         .map(Some)
         .map_err(|error| format!("failed to encode OpenClaw workspace dependency paths: {error}"))
 }
@@ -519,10 +532,13 @@ fn local_build_npm_adapter(
         return Ok(None);
     }
 
-    let adapter_path = repo_path.join("scripts/ocm-npm-workspace-deps.mjs");
-    if !adapter_path.is_file() {
+    let adapter_path = ["mts", "mjs"]
+        .into_iter()
+        .map(|extension| repo_path.join(format!("scripts/ocm-npm-workspace-deps.{extension}")))
+        .find(|path| path.is_file());
+    let Some(adapter_path) = adapter_path else {
         return Ok(None);
-    }
+    };
 
     Ok(Some(LocalBuildNpmAdapter {
         command: CommandSpec {
@@ -683,6 +699,8 @@ fn pack_local_openclaw_repo(
         .env("npm_config_fund", "false")
         .env("npm_config_audit", "false")
         .env("npm_config_update_notifier", "false")
+        .env_remove("NPM_CONFIG_IGNORE_SCRIPTS")
+        .env("npm_config_ignore_scripts", "false")
         .env("PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN", "false")
         .env("OPENCLAW_PREPACK_ALLOW_UNRELEASED_CHANGELOG", "1")
         .current_dir(repo_path)
