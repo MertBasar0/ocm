@@ -2716,6 +2716,7 @@ impl Cli {
 
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut latest_issue = None;
+        let mut permitted_retry_count = None;
         while Instant::now() < deadline {
             let status = self.service_service().status(env_name)?;
             latest_issue = status.issue.clone();
@@ -2724,6 +2725,15 @@ impl Cli {
                 return Ok(None);
             }
             if status.gateway_state == "backoff" && status.last_exit_code != Some(0) {
+                if should_wait_for_scheduled_gateway_retry(
+                    &mut permitted_retry_count,
+                    status.child_restart_count,
+                    status.next_retry_at.as_deref(),
+                    time::OffsetDateTime::now_utc(),
+                ) {
+                    sleep(Duration::from_millis(500));
+                    continue;
+                }
                 let issue = status
                     .issue
                     .or(status.last_error)
@@ -4021,6 +4031,33 @@ fn gateway_health_ok(port: u32) -> bool {
     text.starts_with("HTTP/1.1 200") || text.starts_with("HTTP/1.0 200")
 }
 
+fn should_wait_for_scheduled_gateway_retry(
+    permitted_retry_count: &mut Option<usize>,
+    restart_count: Option<usize>,
+    next_retry_at: Option<&str>,
+    now: time::OffsetDateTime,
+) -> bool {
+    let (Some(restart_count), Some(next_retry_at)) = (restart_count, next_retry_at) else {
+        return false;
+    };
+    let Ok(next_retry_at) = time::OffsetDateTime::parse(
+        next_retry_at,
+        &time::format_description::well_known::Rfc3339,
+    ) else {
+        return false;
+    };
+    if now > next_retry_at + time::Duration::seconds(3) {
+        return false;
+    }
+    match permitted_retry_count {
+        Some(permitted) => restart_count == *permitted,
+        None => {
+            *permitted_retry_count = Some(restart_count);
+            true
+        }
+    }
+}
+
 fn verify_gateway_status_readiness(stdout: &str) -> Result<(), String> {
     let status: Value = serde_json::from_str(stdout.trim()).map_err(|error| {
         format!("post-upgrade gateway readiness failed: invalid status JSON ({error})")
@@ -4127,7 +4164,8 @@ fn gateway_auth_failure_proves_reachable(error: &str) -> bool {
 mod tests {
     use super::{
         command_output_reports_unsupported_command, release_version_from_output,
-        verify_gateway_status_readiness, version_output_matches_expected,
+        should_wait_for_scheduled_gateway_retry, verify_gateway_status_readiness,
+        version_output_matches_expected,
     };
 
     #[test]
@@ -4269,6 +4307,61 @@ mod tests {
             unknown.contains("did not report RPC reachability"),
             "{unknown}"
         );
+    }
+
+    #[test]
+    fn scheduled_gateway_retry_allows_only_the_observed_next_attempt() {
+        let now = time::OffsetDateTime::now_utc();
+        let next_retry_at = (now + time::Duration::seconds(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let mut permitted_retry_count = None;
+
+        assert!(should_wait_for_scheduled_gateway_retry(
+            &mut permitted_retry_count,
+            Some(2),
+            Some(&next_retry_at),
+            now,
+        ));
+        assert!(should_wait_for_scheduled_gateway_retry(
+            &mut permitted_retry_count,
+            Some(2),
+            Some(&next_retry_at),
+            now,
+        ));
+        assert!(!should_wait_for_scheduled_gateway_retry(
+            &mut permitted_retry_count,
+            Some(3),
+            Some(&next_retry_at),
+            now,
+        ));
+    }
+
+    #[test]
+    fn scheduled_gateway_retry_rejects_missing_or_stale_retry_state() {
+        let now = time::OffsetDateTime::now_utc();
+        let stale_retry_at = (now - time::Duration::seconds(4))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+
+        assert!(!should_wait_for_scheduled_gateway_retry(
+            &mut None,
+            Some(1),
+            None,
+            now,
+        ));
+        assert!(!should_wait_for_scheduled_gateway_retry(
+            &mut None,
+            Some(1),
+            Some(&stale_retry_at),
+            now,
+        ));
+        assert!(!should_wait_for_scheduled_gateway_retry(
+            &mut None,
+            Some(1),
+            Some("not-a-timestamp"),
+            now,
+        ));
     }
 
     #[test]

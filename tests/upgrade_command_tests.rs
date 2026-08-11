@@ -2,16 +2,18 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread::{self, sleep};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use flate2::{Compression, write::GzEncoder};
@@ -148,6 +150,62 @@ fn write_backoff_supervisor_runtime(
         children: Vec::new(),
     };
     fs::write(runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+}
+
+fn spawn_converging_health_server() -> (
+    u32,
+    Arc<AtomicUsize>,
+    Arc<AtomicBool>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = u32::from(listener.local_addr().unwrap().port());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_thread = Arc::clone(&requests);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let handle = thread::spawn(move || {
+        while !stop_thread.load(Ordering::Relaxed) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("health listener failed: {error}"),
+            };
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).unwrap_or(0);
+            if !request[..read].starts_with(b"GET /health ") {
+                continue;
+            }
+            let request_number = requests_thread.fetch_add(1, Ordering::SeqCst);
+            let status = if request_number == 0 {
+                "503 Service Unavailable"
+            } else {
+                "200 OK"
+            };
+            let body = if request_number == 0 {
+                br#"{"ok":false}"#.as_slice()
+            } else {
+                br#"{"ok":true}"#.as_slice()
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    (port, requests, stop, handle)
+}
+
+fn stop_converging_health_server(port: u32, stop: &AtomicBool, handle: thread::JoinHandle<()>) {
+    stop.store(true, Ordering::Relaxed);
+    let _ = TcpStream::connect(("127.0.0.1", port as u16));
+    handle.join().unwrap();
 }
 
 fn recording_openclaw_script(version: &str) -> String {
@@ -1076,6 +1134,187 @@ fn upgrade_rolls_back_when_gateway_rpc_is_not_ready() {
         .join("demo")
         .join(format!("{}.recovery", record["id"].as_str().unwrap()));
     assert!(!recovery_root.exists());
+}
+
+#[test]
+fn upgrade_waits_for_one_supervisor_convergence_retry() {
+    let root = TestDir::new("upgrade-supervisor-convergence-retry");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let (health_port, health_requests, health_stop, health_handle) =
+        spawn_converging_health_server();
+
+    let old_runtime = root.child("old-openclaw");
+    let new_runtime = root.child("new-openclaw");
+    write_executable_script(&old_runtime, &recording_openclaw_script("2026.8.1"));
+    write_executable_script(&new_runtime, &recording_openclaw_script("2026.8.2"));
+
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    for (name, runtime) in [("old", &old_runtime), ("new", &new_runtime)] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", name, "--path", &path_string(runtime)],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+    }
+
+    let start = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "start",
+            "demo",
+            "--runtime",
+            "old",
+            "--port",
+            &health_port.to_string(),
+        ],
+    );
+    assert!(start.status.success(), "{}", stderr(&start));
+
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
+    let ocm_home = env.get("OCM_HOME").unwrap().clone();
+    write_running_supervisor_runtime(&runtime_path, &ocm_home, "old", 4242, health_port);
+    let registry_path = env_registry_path(&env, &cwd).unwrap();
+    let state_path = supervisor_state_path(&env, &cwd).unwrap();
+    let observer_done = Arc::new(AtomicBool::new(false));
+    let observer_done_thread = Arc::clone(&observer_done);
+    let observer_health_requests = Arc::clone(&health_requests);
+    let observer_runtime_path = runtime_path.clone();
+    let observer_ocm_home = ocm_home.clone();
+    let observer = thread::spawn(move || {
+        let mut last_binding = "old".to_string();
+        let mut last_desired_running = true;
+        let mut next_pid = 4243;
+        let mut restart_acknowledged = false;
+        let mut backoff_started = None;
+        let mut saw_backoff = false;
+        let mut recovered_target = false;
+        while !observer_done_thread.load(Ordering::Relaxed) {
+            let registry = fs::read(&registry_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .unwrap_or(Value::Null);
+            let env_meta = registry["envs"]
+                .as_array()
+                .and_then(|envs| envs.iter().find(|entry| entry["name"] == "demo"));
+            let binding = env_meta
+                .and_then(|entry| entry["defaultRuntime"].as_str())
+                .unwrap_or(&last_binding)
+                .to_string();
+            let desired_running = env_meta
+                .and_then(|entry| entry["serviceRunning"].as_bool())
+                .unwrap_or(true);
+
+            if desired_running != last_desired_running {
+                if desired_running {
+                    write_running_supervisor_runtime(
+                        &observer_runtime_path,
+                        &observer_ocm_home,
+                        &binding,
+                        next_pid,
+                        health_port,
+                    );
+                    next_pid += 1;
+                } else {
+                    write_empty_supervisor_runtime(&observer_runtime_path, &observer_ocm_home);
+                }
+                last_desired_running = desired_running;
+                last_binding = binding.clone();
+            } else if binding != last_binding && desired_running {
+                write_running_supervisor_runtime(
+                    &observer_runtime_path,
+                    &observer_ocm_home,
+                    &binding,
+                    next_pid,
+                    health_port,
+                );
+                next_pid += 1;
+                last_binding = binding.clone();
+            }
+
+            let restart_requested = fs::read(&state_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|state| state["restartRequests"].as_array().cloned())
+                .is_some_and(|requests| {
+                    requests.iter().any(|request| request["envName"] == "demo")
+                });
+            if binding == "new" && desired_running && restart_requested && !restart_acknowledged {
+                write_running_supervisor_runtime(
+                    &observer_runtime_path,
+                    &observer_ocm_home,
+                    "new",
+                    next_pid,
+                    health_port,
+                );
+                next_pid += 1;
+                restart_acknowledged = true;
+            }
+
+            if binding == "new"
+                && desired_running
+                && !saw_backoff
+                && observer_health_requests.load(Ordering::SeqCst) >= 1
+            {
+                write_backoff_supervisor_runtime(
+                    &observer_runtime_path,
+                    &observer_ocm_home,
+                    "new",
+                    health_port,
+                );
+                backoff_started = Some(Instant::now());
+                saw_backoff = true;
+            }
+
+            if binding == "new"
+                && desired_running
+                && !recovered_target
+                && backoff_started
+                    .is_some_and(|started| started.elapsed() >= Duration::from_secs(2))
+            {
+                write_running_supervisor_runtime(
+                    &observer_runtime_path,
+                    &observer_ocm_home,
+                    "new",
+                    next_pid,
+                    health_port,
+                );
+                recovered_target = true;
+            }
+            sleep(Duration::from_millis(1));
+        }
+        (saw_backoff, recovered_target)
+    });
+
+    let upgrade = run_ocm(&cwd, &env, &["upgrade", "demo", "--runtime", "new"]);
+    observer_done.store(true, Ordering::Relaxed);
+    let (saw_backoff, recovered_target) = observer.join().unwrap();
+    stop_converging_health_server(health_port, &health_stop, health_handle);
+
+    assert!(
+        saw_backoff,
+        "fixture never exposed the scheduled retry state"
+    );
+    assert!(
+        upgrade.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&upgrade),
+        stderr(&upgrade)
+    );
+    assert!(recovered_target, "fixture retry never became healthy");
+    assert!(health_requests.load(Ordering::SeqCst) >= 2);
+    let shown = run_ocm(&cwd, &env, &["env", "show", "demo", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["defaultRuntime"], "new");
 }
 
 #[cfg(unix)]
