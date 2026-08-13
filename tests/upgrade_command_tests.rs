@@ -1411,6 +1411,7 @@ fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
     let target: Value = serde_json::from_str(&stdout(&target)).unwrap();
     let target_root = PathBuf::from(target["installRoot"].as_str().unwrap());
     let target_entrypoint = target_root.join("files/node_modules/openclaw/openclaw.mjs");
+    let target_host_root = target_root.join("files/node_modules/openclaw");
     let target_chunks = target_root.join("files/node_modules/openclaw/dist/chunks");
     fs::create_dir_all(&target_chunks).unwrap();
     for index in 0..2_000 {
@@ -1424,6 +1425,32 @@ fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
     let entrypoint_hash_before = Sha512::digest(fs::read(&target_entrypoint).unwrap()).to_vec();
     let entrypoint_inode_before = fs::metadata(&target_entrypoint).unwrap().ino();
     let chunk_inode_before = fs::metadata(&watched_chunk).unwrap().ino();
+
+    let source = run_ocm(&cwd, &env, &["runtime", "show", source_version, "--json"]);
+    assert!(source.status.success(), "{}", stderr(&source));
+    let source: Value = serde_json::from_str(&stdout(&source)).unwrap();
+    let source_host_root =
+        PathBuf::from(source["installRoot"].as_str().unwrap()).join("files/node_modules/openclaw");
+    let state_root = root.child("ocm-home/envs/demo/.openclaw");
+    let plugin_ids = ["clickclack", "codex", "discord", "llama-cpp"];
+    let peer_links = plugin_ids.map(|plugin_id| {
+        let package_root = state_root
+            .join("npm/projects")
+            .join(plugin_id)
+            .join("node_modules/@openclaw")
+            .join(plugin_id);
+        fs::create_dir_all(package_root.join("node_modules")).unwrap();
+        fs::write(
+            package_root.join("package.json"),
+            format!(
+                "{{\"name\":\"@openclaw/{plugin_id}\",\"peerDependencies\":{{\"openclaw\":\"*\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        let peer_link = package_root.join("node_modules/openclaw");
+        std::os::unix::fs::symlink(&source_host_root, &peer_link).unwrap();
+        peer_link
+    });
 
     let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
     fs::create_dir_all(runtime_path.parent().unwrap()).unwrap();
@@ -1447,11 +1474,14 @@ fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
     let missing_target_file_thread = Arc::clone(&missing_target_file);
     let observed_entrypoint = target_entrypoint.clone();
     let observed_chunk = watched_chunk.clone();
+    let observed_peer_links = peer_links.clone();
+    let rejected_host_root = target_host_root.clone();
     let observer_runtime_path = runtime_path.clone();
     let observer_ocm_home = ocm_home.clone();
     let observer = thread::spawn(move || {
         let mut last_binding = Some(source_version.to_string());
         let mut target_was_running = false;
+        let mut target_was_quiesced = false;
         let mut target_restart_was_acknowledged = false;
         let mut target_entered_backoff = false;
         let mut observed_bindings = Vec::new();
@@ -1491,15 +1521,27 @@ fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
                         );
                         target_was_running = true;
                     }
-                    Some(value) if value == source_version => write_running_supervisor_runtime(
-                        &observer_runtime_path,
-                        &observer_ocm_home,
-                        source_version,
-                        4244,
-                        health_port,
-                    ),
+                    Some(value) if value == source_version => {
+                        if target_was_running && !target_was_quiesced {
+                            for peer_link in &observed_peer_links[..2] {
+                                fs::remove_file(peer_link).unwrap();
+                                std::os::unix::fs::symlink(&rejected_host_root, peer_link).unwrap();
+                            }
+                            fs::remove_file(&observed_peer_links[2]).unwrap();
+                        }
+                        write_running_supervisor_runtime(
+                            &observer_runtime_path,
+                            &observer_ocm_home,
+                            source_version,
+                            4244,
+                            health_port,
+                        )
+                    }
                     None => {
-                        write_empty_supervisor_runtime(&observer_runtime_path, &observer_ocm_home)
+                        write_empty_supervisor_runtime(&observer_runtime_path, &observer_ocm_home);
+                        if target_was_running {
+                            target_was_quiesced = true;
+                        }
                     }
                     _ => {}
                 }
@@ -1533,7 +1575,11 @@ fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
             }
             sleep(Duration::from_millis(1));
         }
-        (target_entered_backoff, observed_bindings)
+        (
+            target_entered_backoff,
+            target_was_quiesced,
+            observed_bindings,
+        )
     });
 
     env.insert("OCM_TEST_GATEWAY_UNREADY".to_string(), "1".to_string());
@@ -1543,7 +1589,7 @@ fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
         &["upgrade", "demo", "--runtime", target_version],
     );
     observer_done.store(true, Ordering::Relaxed);
-    let (target_entered_backoff, observed_bindings) = observer.join().unwrap();
+    let (target_entered_backoff, target_was_quiesced, observed_bindings) = observer.join().unwrap();
 
     assert!(!upgrade.status.success(), "{}", stdout(&upgrade));
     let output = stdout(&upgrade);
@@ -1552,6 +1598,10 @@ fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
     assert!(
         target_entered_backoff,
         "target never entered fixture backoff"
+    );
+    assert!(
+        target_was_quiesced,
+        "rejected target was not quiesced before source restoration"
     );
     let target_observed = observed_bindings
         .iter()
@@ -1588,6 +1638,56 @@ fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
     assert!(shown.status.success(), "{}", stderr(&shown));
     let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
     assert_eq!(shown["defaultRuntime"], source_version);
+    assert_eq!(peer_links.len(), 4);
+    let mut resolved_peer_targets = Vec::new();
+    for peer_link in &peer_links {
+        assert_eq!(
+            fs::read_link(peer_link).unwrap(),
+            source_host_root,
+            "{}",
+            peer_link.display()
+        );
+        let resolved = fs::canonicalize(peer_link).unwrap();
+        assert_eq!(
+            resolved,
+            fs::canonicalize(&source_host_root).unwrap(),
+            "{}",
+            peer_link.display()
+        );
+        assert_ne!(
+            resolved,
+            fs::canonicalize(&target_host_root).unwrap(),
+            "{} still resolves to the rejected runtime",
+            peer_link.display()
+        );
+        resolved_peer_targets.push(resolved);
+    }
+
+    let service = run_ocm(&cwd, &env, &["service", "status", "demo", "--json"]);
+    assert!(service.status.success(), "{}", stderr(&service));
+    let service: Value = serde_json::from_str(&stdout(&service)).unwrap();
+    assert_eq!(service["running"], true);
+    assert_eq!(service["bindingName"], source_version);
+
+    env.remove("OCM_TEST_GATEWAY_UNREADY");
+    let gateway = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env", "run", "demo", "--", "gateway", "status", "--deep", "--json",
+        ],
+    );
+    assert!(gateway.status.success(), "{}", stderr(&gateway));
+    assert!(
+        stdout(&gateway).contains(r#""ok":true"#),
+        "{}",
+        stdout(&gateway)
+    );
+    eprintln!(
+        "rollback proof: binding={source_version} plugins={} peerTarget={} gatewayRpc=ok channels=fixture-not-supported",
+        resolved_peer_targets.len(),
+        source_host_root.display()
+    );
 }
 
 #[test]

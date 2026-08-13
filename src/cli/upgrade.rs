@@ -3391,11 +3391,13 @@ impl Cli {
         transaction: &UpgradeTransaction,
     ) -> Result<(), String> {
         let changes_runtime_trees = !transaction.mutated_runtime_names.is_empty();
-        if changes_runtime_trees {
+        let changes_binding = transaction.source.kind != transaction.target.kind
+            || transaction.source.name != transaction.target.name;
+        if changes_runtime_trees || changes_binding {
             self.service_service()
                 .quiesce_for_runtime_mutation_locked(env_name)
                 .map_err(|error| {
-                    format!("failed to quiesce the failed target before runtime rollback: {error}")
+                    format!("failed to quiesce the failed target before upgrade rollback: {error}")
                 })?;
         }
         for runtime_backup in transaction.runtime_backups.iter().filter(|backup| {
