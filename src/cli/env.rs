@@ -808,17 +808,21 @@ impl Cli {
 
         let snapshot = self.with_progress(format!("Creating snapshot for {name}"), || {
             let _operation_lock = self.environment_service().lock_operation(name)?;
+            let prepared = self
+                .environment_service()
+                .prepare_snapshot_capture_locked(name)?;
             let service_state = self
                 .service_service()
                 .quiesce_for_snapshot_locked(name)?;
             let snapshot_result = self
                 .environment_service()
-                .create_snapshot_locked_with_service_state(
+                .create_snapshot_locked_from_preparation(
                     CreateEnvSnapshotOptions {
                         env_name: name.clone(),
                         label,
                     },
                     service_state.map(|state| (state.enabled, state.running)),
+                    prepared,
                 );
             let service_result = self
                 .service_service()

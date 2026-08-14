@@ -2940,6 +2940,9 @@ impl Cli {
         rollback_of: Option<String>,
     ) -> Result<UpgradeTransaction, String> {
         let env_meta = self.environment_service().get(env_name)?;
+        let prepared = self
+            .environment_service()
+            .prepare_snapshot_capture_locked(env_name)?;
         let service_state = self
             .service_service()
             .quiesce_for_snapshot_locked(env_name)?;
@@ -2951,12 +2954,13 @@ impl Cli {
         );
         let snapshot_result = self
             .environment_service()
-            .create_snapshot_locked_with_service_state(
+            .create_snapshot_locked_from_preparation(
                 CreateEnvSnapshotOptions {
                     env_name: env_name.to_string(),
                     label: Some(snapshot_label.to_string()),
                 },
                 Some((env_meta.service_enabled, env_meta.service_running)),
+                prepared,
             );
         let snapshot = match snapshot_result {
             Ok(snapshot) => snapshot,

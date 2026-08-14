@@ -5,10 +5,11 @@ use time::{Duration, OffsetDateTime};
 
 use super::EnvironmentService;
 use crate::store::{
-    EnvSnapshotRestoreTransaction, commit_env_snapshot_restore, create_env_snapshot,
-    create_env_snapshot_with_service_state, get_env_snapshot, list_all_env_snapshots,
-    list_env_snapshots, now_utc, prepare_env_snapshot_restore, remove_env_snapshot,
-    restore_env_snapshot, rollback_env_snapshot_restore, summarize_snapshot,
+    EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, commit_env_snapshot_restore,
+    create_env_snapshot, create_env_snapshot_from_preparation, get_env_snapshot,
+    list_all_env_snapshots, list_env_snapshots, now_utc, prepare_env_snapshot_capture,
+    prepare_env_snapshot_restore, remove_env_snapshot, restore_env_snapshot,
+    rollback_env_snapshot_restore, summarize_snapshot,
 };
 use crate::supervisor::sync_supervisor_if_present;
 
@@ -138,13 +139,26 @@ impl<'a> EnvironmentService<'a> {
         Ok(summarize_snapshot(&meta))
     }
 
-    pub(crate) fn create_snapshot_locked_with_service_state(
+    pub(crate) fn prepare_snapshot_capture_locked(
+        &self,
+        env_name: &str,
+    ) -> Result<PreparedEnvSnapshotCapture, String> {
+        prepare_env_snapshot_capture(env_name, self.env, self.cwd)
+    }
+
+    pub(crate) fn create_snapshot_locked_from_preparation(
         &self,
         options: CreateEnvSnapshotOptions,
         service_state: Option<(bool, bool)>,
+        prepared: PreparedEnvSnapshotCapture,
     ) -> Result<EnvSnapshotSummary, String> {
-        let meta =
-            create_env_snapshot_with_service_state(options, service_state, self.env, self.cwd)?;
+        let meta = create_env_snapshot_from_preparation(
+            options,
+            service_state,
+            prepared,
+            self.env,
+            self.cwd,
+        )?;
         Ok(summarize_snapshot(&meta))
     }
 

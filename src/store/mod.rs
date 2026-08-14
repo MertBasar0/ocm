@@ -79,9 +79,9 @@ pub use runtimes::{
     install_runtime_from_url, list_runtimes, remove_runtime, runtime_integrity_issue,
 };
 pub(crate) use snapshots::{
-    EnvSnapshotRestoreTransaction, commit_env_snapshot_restore,
-    create_env_snapshot_with_service_state, prepare_env_snapshot_restore,
-    rollback_env_snapshot_restore,
+    EnvSnapshotRestoreTransaction, PreparedEnvSnapshotCapture, commit_env_snapshot_restore,
+    create_env_snapshot_from_preparation, prepare_env_snapshot_capture,
+    prepare_env_snapshot_restore, rollback_env_snapshot_restore,
 };
 pub use snapshots::{
     create_env_snapshot, get_env_snapshot, list_all_env_snapshots, list_env_snapshots,

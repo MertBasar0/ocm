@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use super::checkpoints::{
-    STORAGE_TAR_ARCHIVE, copy_tree_checkpoint, create_tree_checkpoint,
-    default_snapshot_storage_kind, remove_tree_if_present,
+    PreparedTreeCheckpoint, STORAGE_TAR_ARCHIVE, copy_tree_checkpoint,
+    create_tree_checkpoint_from_preparation, default_snapshot_storage_kind,
+    prepare_tree_checkpoint, remove_tree_if_present,
 };
 use super::common::{
     copy_dir_recursive, copy_path_recursive, load_json_files, path_exists, read_json, write_json,
@@ -69,6 +70,13 @@ pub(crate) struct EnvSnapshotRestoreTransaction {
 }
 
 #[derive(Debug)]
+pub(crate) struct PreparedEnvSnapshotCapture {
+    env_name: String,
+    source_root: PathBuf,
+    checkpoint: PreparedTreeCheckpoint,
+}
+
+#[derive(Debug)]
 struct RestoreOperationNamespace {
     root: PathBuf,
     candidate_root: PathBuf,
@@ -91,11 +99,57 @@ pub(crate) fn create_env_snapshot_with_service_state(
     env: &BTreeMap<String, String>,
     cwd: &Path,
 ) -> Result<EnvSnapshotMeta, String> {
+    let prepared = prepare_env_snapshot_capture(&options.env_name, env, cwd)?;
+    create_env_snapshot_from_preparation(options, service_state, prepared, env, cwd)
+}
+
+pub(crate) fn prepare_env_snapshot_capture(
+    env_name: &str,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<PreparedEnvSnapshotCapture, String> {
+    let env_name = validate_name(env_name, "Environment name")?;
+    let meta = get_environment(&env_name, env, cwd)?;
+    let env_paths = derive_env_paths(Path::new(&meta.root));
+    if !path_exists(&env_paths.root) {
+        return Err(format!(
+            "environment root does not exist: {}",
+            display_path(&env_paths.root)
+        ));
+    }
+    let checkpoint = prepare_tree_checkpoint(&env_paths.root)?;
+    Ok(PreparedEnvSnapshotCapture {
+        env_name,
+        source_root: env_paths.root,
+        checkpoint,
+    })
+}
+
+pub(crate) fn create_env_snapshot_from_preparation(
+    options: CreateEnvSnapshotOptions,
+    service_state: Option<(bool, bool)>,
+    prepared: PreparedEnvSnapshotCapture,
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+) -> Result<EnvSnapshotMeta, String> {
     let env_name = validate_name(&options.env_name, "Environment name")?;
+    if prepared.env_name != env_name {
+        return Err(format!(
+            "prepared snapshot belongs to environment \"{}\", not \"{env_name}\"",
+            prepared.env_name
+        ));
+    }
     let meta = get_environment(&env_name, env, cwd)?;
     let (service_enabled, service_running) =
         service_state.unwrap_or((meta.service_enabled, meta.service_running));
     let env_paths = derive_env_paths(Path::new(&meta.root));
+    if env_paths.root != prepared.source_root {
+        return Err(format!(
+            "environment root changed after snapshot preparation: expected {}, found {}",
+            display_path(&prepared.source_root),
+            display_path(&env_paths.root)
+        ));
+    }
     if !path_exists(&env_paths.root) {
         return Err(format!(
             "environment root does not exist: {}",
@@ -113,7 +167,8 @@ pub(crate) fn create_env_snapshot_with_service_state(
     let meta_path = snapshot_meta_path(&env_name, &snapshot_id, env, cwd)?;
 
     let result = (|| {
-        let storage_kind = create_tree_checkpoint(&env_paths.root, &checkpoint_path)?;
+        let storage_kind =
+            create_tree_checkpoint_from_preparation(prepared.checkpoint, &checkpoint_path)?;
         let snapshot = EnvSnapshotMeta {
             kind: "ocm-env-snapshot".to_string(),
             id: snapshot_id,

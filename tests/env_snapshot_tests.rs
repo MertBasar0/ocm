@@ -7,7 +7,10 @@ use std::sync::{
 };
 use std::thread;
 use std::time::Duration;
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use ocm::store::{env_registry_path, now_utc, supervisor_runtime_path};
 use ocm::supervisor::{SupervisorRuntimeChild, SupervisorRuntimeService, SupervisorRuntimeState};
@@ -355,22 +358,39 @@ fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {
     let future_state = env_root.join("durable-future/state.txt");
     let future_non_sqlite_db = env_root.join("durable-future/cache.db");
     let future_link = env_root.join("durable-future/state-link");
+    let browser_cookie = env_root.join(".openclaw/browser/profile/Default/Cookies");
+    let plugin_state = env_root.join(".openclaw/plugins/example/state.json");
+    let generated_module = env_root.join(".openclaw/workspace/node_modules/example/index.js");
+    let generated_build = env_root.join(".openclaw/workspace/build/generated.js");
     let database_path = env_root.join(".openclaw/state/durable.sqlite");
+    let database_wal = PathBuf::from(format!("{}-wal", database_path.display()));
+    let database_shm = PathBuf::from(format!("{}-shm", database_path.display()));
     write_text(&dotenv, "OPENCLAW_SENTINEL=before\n");
     write_text(&secret, "secret-before\n");
     write_text(&future_state, "future-before\n");
     write_text(&future_non_sqlite_db, "opaque future cache\n");
+    write_text(&browser_cookie, "browser-cookie-before\n");
+    write_text(&plugin_state, "{\"state\":\"before\"}\n");
+    write_text(&generated_module, "module.exports = 'before';\n");
+    write_text(&generated_build, "export const generated = 'before';\n");
     fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
     symlink("state.txt", &future_link).unwrap();
     fs::create_dir_all(database_path.parent().unwrap()).unwrap();
     let database = Connection::open(&database_path).unwrap();
+    let journal_mode: String = database
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode, "wal");
     database
         .execute_batch(
-            "CREATE TABLE durable_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE durable_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO durable_state VALUES ('sentinel', 'before');",
         )
         .unwrap();
-    drop(database);
+    assert!(database_wal.exists());
+    assert!(database_shm.exists());
+    let expected_wal = fs::read(&database_wal).unwrap();
 
     let snapshot = run_ocm(
         &cwd,
@@ -380,9 +400,14 @@ fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {
     assert!(snapshot.status.success(), "{}", stderr(&snapshot));
     let snapshot_json: Value = serde_json::from_str(&stdout(&snapshot)).unwrap();
     let snapshot_id = snapshot_json["id"].as_str().unwrap();
+    drop(database);
 
     write_text(&dotenv, "OPENCLAW_SENTINEL=after\n");
     write_text(&secret, "secret-after\n");
+    write_text(&browser_cookie, "browser-cookie-after\n");
+    write_text(&plugin_state, "{\"state\":\"after\"}\n");
+    fs::remove_file(&generated_module).unwrap();
+    fs::remove_file(&generated_build).unwrap();
     fs::remove_file(&future_link).unwrap();
     fs::remove_file(&future_state).unwrap();
     let database = Connection::open(&database_path).unwrap();
@@ -415,7 +440,25 @@ fn env_snapshot_restores_the_complete_durable_root_with_metadata_and_sqlite() {
         fs::read_to_string(&future_non_sqlite_db).unwrap(),
         "opaque future cache\n"
     );
+    assert_eq!(
+        fs::read_to_string(&browser_cookie).unwrap(),
+        "browser-cookie-before\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&plugin_state).unwrap(),
+        "{\"state\":\"before\"}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&generated_module).unwrap(),
+        "module.exports = 'before';\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&generated_build).unwrap(),
+        "export const generated = 'before';\n"
+    );
     assert_eq!(fs::read_link(&future_link).unwrap(), Path::new("state.txt"));
+    assert_eq!(fs::read(&database_wal).unwrap(), expected_wal);
+    assert!(fs::metadata(&database_shm).unwrap().len() > 0);
 
     let restored = Connection::open_with_flags(
         &database_path,
@@ -1583,14 +1626,43 @@ fn env_snapshot_removes_partial_artifacts_when_sqlite_snapshot_fails() {
     let root = TestDir::new("env-snapshot-invalid-sqlite");
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
-    let env = ocm_env(&root);
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let health = TestHttpServer::serve_bytes_times("/health", "text/plain", b"ok", 10);
+    let health_port = url::Url::parse(&health.url()).unwrap().port().unwrap() as u32;
 
-    let create = run_ocm(&cwd, &env, &["env", "create", "source"]);
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--port",
+            &health_port.to_string(),
+            "--launcher",
+            "stable",
+        ],
+    );
     assert!(create.status.success(), "{}", stderr(&create));
+    let started = run_ocm(&cwd, &env, &["service", "start", "source"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    write_running_snapshot_service(&root, &cwd, &env, health_port);
     let database = root.child("ocm-home/envs/source/.openclaw/state/openclaw.sqlite");
     fs::create_dir_all(database.parent().unwrap()).unwrap();
     fs::write(&database, b"SQLite format 3\0not a valid database").unwrap();
 
+    fs::write(root.child("launchctl.log"), "").unwrap();
     let snapshot = run_ocm(&cwd, &env, &["env", "snapshot", "create", "source"]);
     assert_eq!(snapshot.status.code(), Some(1));
     assert!(
@@ -1603,6 +1675,123 @@ fn env_snapshot_removes_partial_artifacts_when_sqlite_snapshot_fails() {
         "SQLite format 3\0not a valid database"
     );
     assert!(!root.child("ocm-home/snapshots/source").exists());
+    let lifecycle = fs::read_to_string(root.child("launchctl.log")).unwrap();
+    assert!(!lifecycle.contains("bootout "), "{lifecycle}");
+    let shown = run_ocm(&cwd, &env, &["env", "show", "source", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["serviceEnabled"], true);
+    assert_eq!(shown["serviceRunning"], true);
+}
+
+#[test]
+fn env_snapshot_rechecks_sqlite_mutated_after_preflight_and_restores_service() {
+    let root = TestDir::new("env-snapshot-sqlite-mutated-after-preflight");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let health = TestHttpServer::serve_bytes_times("/health", "text/plain", b"ok", 20);
+    let health_port = url::Url::parse(&health.url()).unwrap().port().unwrap() as u32;
+
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "stable", "--command", "openclaw"],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "create",
+            "source",
+            "--port",
+            &health_port.to_string(),
+            "--launcher",
+            "stable",
+        ],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    let started = run_ocm(&cwd, &env, &["service", "start", "source"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+    write_running_snapshot_service(&root, &cwd, &env, health_port);
+
+    let database_path = root.child("ocm-home/envs/source/.openclaw/state/openclaw.sqlite");
+    fs::create_dir_all(database_path.parent().unwrap()).unwrap();
+    let database = Connection::open(&database_path).unwrap();
+    database
+        .execute_batch(
+            "CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO state VALUES ('sentinel', 'before');",
+        )
+        .unwrap();
+    drop(database);
+
+    let runtime_path = supervisor_runtime_path(&env, &cwd).unwrap();
+    let registry_path = env_registry_path(&env, &cwd).unwrap();
+    let running_runtime = fs::read(&runtime_path).unwrap();
+    let ocm_home = env.get("OCM_HOME").unwrap().clone();
+    let observer_done = Arc::new(AtomicBool::new(false));
+    let observer_mutated = Arc::new(AtomicBool::new(false));
+    let observer_done_thread = Arc::clone(&observer_done);
+    let observer_mutated_thread = Arc::clone(&observer_mutated);
+    let observer_database = database_path.clone();
+    let observer_runtime_path = runtime_path.clone();
+    let observer = thread::spawn(move || {
+        let mut last_running = true;
+        while !observer_done_thread.load(Ordering::Relaxed) {
+            let desired_running = fs::read(&registry_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|registry| registry["envs"].as_array().cloned())
+                .and_then(|envs| envs.into_iter().find(|entry| entry["name"] == "source"))
+                .and_then(|entry| entry["serviceRunning"].as_bool())
+                .unwrap_or(last_running);
+            if desired_running != last_running {
+                if desired_running {
+                    fs::write(&observer_runtime_path, &running_runtime).unwrap();
+                } else {
+                    fs::write(
+                        &observer_database,
+                        b"SQLite format 3\0changed after snapshot preflight",
+                    )
+                    .unwrap();
+                    observer_mutated_thread.store(true, Ordering::Relaxed);
+                    write_empty_snapshot_service(&observer_runtime_path, &ocm_home);
+                }
+                last_running = desired_running;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    });
+
+    let snapshot = run_ocm(&cwd, &env, &["env", "snapshot", "create", "source"]);
+    observer_done.store(true, Ordering::Relaxed);
+    observer.join().unwrap();
+
+    assert!(observer_mutated.load(Ordering::Relaxed));
+    assert_eq!(snapshot.status.code(), Some(1));
+    assert!(
+        stderr(&snapshot).contains("SQLite"),
+        "{}",
+        stderr(&snapshot)
+    );
+    assert!(!root.child("ocm-home/snapshots/source").exists());
+    assert_eq!(
+        fs::read_to_string(&database_path).unwrap(),
+        "SQLite format 3\0changed after snapshot preflight"
+    );
+    let shown = run_ocm(&cwd, &env, &["env", "show", "source", "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(shown["serviceEnabled"], true);
+    assert_eq!(shown["serviceRunning"], true);
 }
 
 #[test]
