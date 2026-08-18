@@ -3,7 +3,7 @@ use crate::store::{
     get_environment, save_environment, save_environment_with_validated_launcher,
     save_environment_with_validated_runtime,
 };
-use crate::supervisor::sync_supervisor_if_present;
+use crate::supervisor::sync_supervisor_env_if_present;
 
 impl<'a> EnvironmentService<'a> {
     pub fn set_launcher(&self, name: &str, launcher_name: &str) -> Result<EnvMeta, String> {
@@ -16,7 +16,7 @@ impl<'a> EnvironmentService<'a> {
             meta.default_runtime = None;
         }
         let meta = save_environment_with_validated_launcher(meta, self.env, self.cwd)?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, name)?;
         Ok(meta)
     }
 
@@ -42,7 +42,7 @@ impl<'a> EnvironmentService<'a> {
         } else {
             save_environment(meta, self.env, self.cwd)?
         };
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, name)?;
         Ok(meta)
     }
 }

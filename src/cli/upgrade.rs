@@ -1800,7 +1800,8 @@ impl Cli {
                     .set_runtime_locked(env_name, prepared.name.as_str())
                     .map(|_| ())
             } else {
-                self.runtime_service().refresh_supervisor_if_present()
+                self.runtime_service()
+                    .refresh_supervisor_if_present(&prepared.name)
             };
             if let Err(error) = publish_result {
                 return self.rollback_failed_upgrade(
@@ -2047,7 +2048,11 @@ impl Cli {
                 transaction.mark_post_update_not_needed();
                 None
             };
-            if changed && let Err(error) = self.runtime_service().refresh_supervisor_if_present() {
+            if changed
+                && let Err(error) = self
+                    .runtime_service()
+                    .refresh_supervisor_if_present(&prepared.name)
+            {
                 return self.rollback_failed_upgrade(
                     env_name,
                     "runtime",
@@ -2232,7 +2237,10 @@ impl Cli {
                 );
             }
         };
-        if let Err(error) = self.runtime_service().refresh_supervisor_if_present() {
+        if let Err(error) = self
+            .runtime_service()
+            .refresh_supervisor_if_present(&updated.name)
+        {
             return self.rollback_failed_upgrade(
                 env_name,
                 "runtime",

@@ -219,7 +219,7 @@ impl<'a> RuntimeService<'a> {
         let action = prepared.action();
         let meta = prepared.commit()?;
         if refresh_supervisor {
-            self.refresh_supervisor_if_present()?;
+            self.refresh_supervisor_if_present(&meta.name)?;
         }
         Ok((meta, action))
     }
@@ -384,7 +384,7 @@ impl<'a> RuntimeService<'a> {
         let name = options.name.clone();
         let meta =
             self.with_unbound_runtime(&name, || install_runtime(options, self.env, self.cwd))?;
-        self.refresh_supervisor_if_present()?;
+        self.refresh_supervisor_if_present(&name)?;
         Ok(meta)
     }
 
@@ -396,7 +396,7 @@ impl<'a> RuntimeService<'a> {
         let meta = self.with_unbound_runtime(&name, || {
             install_runtime_from_url(options, self.env, self.cwd)
         })?;
-        self.refresh_supervisor_if_present()?;
+        self.refresh_supervisor_if_present(&name)?;
         Ok(meta)
     }
 
@@ -408,7 +408,7 @@ impl<'a> RuntimeService<'a> {
         let meta = self.with_unbound_runtime(&name, || {
             install_runtime_from_release(options, self.env, self.cwd)
         })?;
-        self.refresh_supervisor_if_present()?;
+        self.refresh_supervisor_if_present(&name)?;
         Ok(meta)
     }
 
@@ -420,7 +420,7 @@ impl<'a> RuntimeService<'a> {
         let meta = self.with_unbound_runtime(&name, || {
             install_runtime_from_official_openclaw_release(options, self.env, self.cwd)
         })?;
-        self.refresh_supervisor_if_present()?;
+        self.refresh_supervisor_if_present(&name)?;
         Ok(meta)
     }
 
@@ -441,7 +441,7 @@ impl<'a> RuntimeService<'a> {
                 },
             )
         })?;
-        self.refresh_supervisor_if_present()?;
+        self.refresh_supervisor_if_present(&name)?;
         Ok(meta)
     }
 
@@ -528,7 +528,7 @@ impl<'a> RuntimeService<'a> {
         let prepared = self.prepare_resolved_update(resolved)?;
         let meta = prepared.commit()?;
         if refresh_supervisor {
-            self.refresh_supervisor_if_present()?;
+            self.refresh_supervisor_if_present(&meta.name)?;
         }
         Ok(meta)
     }

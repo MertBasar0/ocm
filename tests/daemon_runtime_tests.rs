@@ -9,7 +9,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use ocm::env::EnvironmentService;
-use ocm::supervisor::SupervisorService;
+use ocm::supervisor::{SupervisorService, sync_supervisor_binding_if_present};
 use serde_json::{Value, to_value};
 
 use crate::support::{
@@ -818,6 +818,245 @@ fn daemon_run_reloads_children_after_binding_changes() {
     assert!(wait_for_file(&new_started, Duration::from_secs(5)));
 
     stop_process(&mut daemon);
+}
+
+#[test]
+fn publishing_an_unbound_runtime_preserves_unrelated_active_child_spec_and_pid() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-unbound-runtime-publish");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let runtime_meta_path = root.child("ocm-home/runtimes/runtime-a.json");
+    let started = root.child("runtime-a-started.txt");
+    let stopped = root.child("runtime-a-stopped.txt");
+
+    let runtime_a = root.child("bin/runtime-a");
+    write_legacy_openclaw_script(
+        &runtime_a,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            path_string(&started),
+            path_string(&stopped),
+        ),
+    );
+    let add_a = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "add",
+            "runtime-a",
+            "--path",
+            &path_string(&runtime_a),
+        ],
+    );
+    assert!(add_a.status.success(), "{}", stderr(&add_a));
+    let create = run_ocm(
+        &cwd,
+        &env,
+        &["env", "create", "env-a", "--runtime", "runtime-a"],
+    );
+    assert!(create.status.success(), "{}", stderr(&create));
+    set_service_enabled(&cwd, &env, "env-a", true);
+    service.sync().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime =
+        wait_for_runtime_children(&runtime_path, 1, Some("env-a"), Duration::from_secs(5))
+            .expect("daemon runtime state did not report env-a");
+    let initial_pid = runtime_child_pid(&initial_runtime, "env-a").unwrap();
+
+    let mut latent_runtime_meta = read_persisted_service_state(&runtime_meta_path);
+    latent_runtime_meta["releaseVersion"] = Value::String("latent-v2".to_string());
+    write_persisted_service_state(&runtime_meta_path, &latent_runtime_meta);
+
+    let runtime_b = root.child("bin/runtime-b");
+    write_legacy_openclaw_script(&runtime_b, "#!/bin/sh\nexit 0\n");
+    let add_b = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "runtime",
+            "add",
+            "runtime-b",
+            "--path",
+            &path_string(&runtime_b),
+        ],
+    );
+    let add_b_error = stderr(&add_b);
+
+    sleep(Duration::from_millis(800));
+    let final_runtime =
+        wait_for_runtime_children(&runtime_path, 1, Some("env-a"), Duration::from_secs(2))
+            .expect("daemon runtime state stopped reporting env-a");
+    let final_pid = runtime_child_pid(&final_runtime, "env-a").unwrap();
+    let state = read_persisted_service_state(&state_path);
+    let persisted_env_a = state["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["envName"] == "env-a")
+        .unwrap()
+        .clone();
+    let started_count = fs::read_to_string(&started).unwrap().lines().count();
+    let stopped_exists = stopped.exists();
+
+    stop_process(&mut daemon);
+
+    assert!(add_b.status.success(), "{add_b_error}");
+    assert_eq!(final_pid, initial_pid, "unrelated child PID changed");
+    assert_eq!(started_count, 1, "unrelated child started more than once");
+    assert!(!stopped_exists, "unrelated child received a stop signal");
+    assert!(
+        persisted_env_a["runtimeReleaseVersion"].is_null(),
+        "unrelated latent runtime metadata was applied"
+    );
+}
+
+#[test]
+fn targeted_runtime_refresh_ignores_unrelated_drift_and_restarts_effective_change_once() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-targeted-runtime-refresh");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let runtime_a_meta_path = root.child("ocm-home/runtimes/runtime-a.json");
+    let runtime_b_meta_path = root.child("ocm-home/runtimes/runtime-b.json");
+    let runtime_a_started = root.child("runtime-a-started.txt");
+    let runtime_a_stopped = root.child("runtime-a-stopped.txt");
+    let runtime_b_started = root.child("runtime-b-started.txt");
+    let runtime_b_stopped = root.child("runtime-b-stopped.txt");
+
+    let runtime_a = root.child("bin/runtime-a");
+    write_legacy_openclaw_script(
+        &runtime_a,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            path_string(&runtime_a_started),
+            path_string(&runtime_a_stopped),
+        ),
+    );
+    let runtime_b = root.child("bin/runtime-b");
+    write_legacy_openclaw_script(
+        &runtime_b,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            path_string(&runtime_b_started),
+            path_string(&runtime_b_stopped),
+        ),
+    );
+    let runtime_b_next = root.child("bin/runtime-b-next");
+    write_legacy_openclaw_script(
+        &runtime_b_next,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            path_string(&runtime_b_started),
+            path_string(&runtime_b_stopped),
+        ),
+    );
+
+    for (name, path) in [("runtime-a", &runtime_a), ("runtime-b", &runtime_b)] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &["runtime", "add", name, "--path", &path_string(path)],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let env_name = name.replace("runtime", "env");
+        let create = run_ocm(&cwd, &env, &["env", "create", &env_name, "--runtime", name]);
+        assert!(create.status.success(), "{}", stderr(&create));
+        set_service_enabled(&cwd, &env, &env_name, true);
+    }
+    service.sync().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
+        .expect("daemon runtime state did not report both children");
+    let env_a_pid = runtime_child_pid(&initial_runtime, "env-a").unwrap();
+    let env_b_pid = runtime_child_pid(&initial_runtime, "env-b").unwrap();
+
+    let mut runtime_a_meta = read_persisted_service_state(&runtime_a_meta_path);
+    runtime_a_meta["releaseVersion"] = Value::String("latent-a-v2".to_string());
+    write_persisted_service_state(&runtime_a_meta_path, &runtime_a_meta);
+
+    let mut runtime_b_meta = read_persisted_service_state(&runtime_b_meta_path);
+    runtime_b_meta["description"] = Value::String("metadata only".to_string());
+    write_persisted_service_state(&runtime_b_meta_path, &runtime_b_meta);
+    sync_supervisor_binding_if_present(&env, &cwd, "runtime", "runtime-b").unwrap();
+
+    sleep(Duration::from_millis(800));
+    let metadata_runtime =
+        wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(2))
+            .expect("daemon runtime state stopped reporting both children");
+    let metadata_a_pid = runtime_child_pid(&metadata_runtime, "env-a").unwrap();
+    let metadata_b_pid = runtime_child_pid(&metadata_runtime, "env-b").unwrap();
+    let metadata_state = read_persisted_service_state(&state_path);
+    let metadata_env_a = metadata_state["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["envName"] == "env-a")
+        .unwrap();
+    let metadata_preserved = metadata_a_pid == env_a_pid
+        && metadata_b_pid == env_b_pid
+        && metadata_env_a["runtimeReleaseVersion"].is_null()
+        && !runtime_a_stopped.exists()
+        && !runtime_b_stopped.exists();
+
+    runtime_b_meta["binaryPath"] = Value::String(path_string(&runtime_b_next));
+    runtime_b_meta["releaseVersion"] = Value::String("effective-b-v2".to_string());
+    write_persisted_service_state(&runtime_b_meta_path, &runtime_b_meta);
+    sync_supervisor_binding_if_present(&env, &cwd, "runtime", "runtime-b").unwrap();
+
+    let changed_runtime = wait_for_runtime_child_pid_change(
+        &runtime_path,
+        "env-b",
+        env_b_pid,
+        "env-a",
+        env_a_pid,
+        Duration::from_secs(10),
+    )
+    .expect("effective runtime change did not replace only env-b");
+    sleep(Duration::from_millis(500));
+    let final_a_pid = runtime_child_pid(&changed_runtime, "env-a").unwrap();
+    let final_b_pid = runtime_child_pid(&changed_runtime, "env-b").unwrap();
+    let runtime_a_start_count = fs::read_to_string(&runtime_a_started)
+        .unwrap()
+        .lines()
+        .count();
+    let runtime_b_start_count = fs::read_to_string(&runtime_b_started)
+        .unwrap()
+        .lines()
+        .count();
+    let runtime_b_stop_count = fs::read_to_string(&runtime_b_stopped)
+        .unwrap()
+        .lines()
+        .count();
+
+    stop_process(&mut daemon);
+
+    assert!(
+        metadata_preserved,
+        "metadata-only refresh changed active state"
+    );
+    assert_eq!(final_a_pid, env_a_pid, "unrelated child PID changed");
+    assert_ne!(final_b_pid, env_b_pid, "effective child PID did not change");
+    assert_eq!(runtime_a_start_count, 1, "unrelated child restarted");
+    assert_eq!(
+        runtime_b_start_count, 2,
+        "effective child did not restart once"
+    );
+    assert_eq!(
+        runtime_b_stop_count, 1,
+        "effective child stop count was not one"
+    );
 }
 
 #[test]

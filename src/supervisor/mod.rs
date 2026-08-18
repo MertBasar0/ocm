@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -252,6 +252,35 @@ pub fn sync_supervisor_if_present(
     Ok(true)
 }
 
+pub fn sync_supervisor_env_if_present(
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    env_name: &str,
+) -> Result<bool, String> {
+    let state_path = supervisor_state_path(env, cwd)?;
+    let runtime_path = supervisor_runtime_path(env, cwd)?;
+    if !state_path.exists() && !runtime_path.exists() {
+        return Ok(false);
+    }
+    SupervisorService::new(env, cwd).sync_env(env_name)?;
+    Ok(true)
+}
+
+pub fn sync_supervisor_binding_if_present(
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    binding_kind: &str,
+    binding_name: &str,
+) -> Result<bool, String> {
+    let state_path = supervisor_state_path(env, cwd)?;
+    let runtime_path = supervisor_runtime_path(env, cwd)?;
+    if !state_path.exists() && !runtime_path.exists() {
+        return Ok(false);
+    }
+    SupervisorService::new(env, cwd).sync_binding(binding_kind, binding_name)?;
+    Ok(true)
+}
+
 impl<'a> SupervisorService<'a> {
     pub fn new(env: &'a BTreeMap<String, String>, cwd: &'a Path) -> Self {
         Self { env, cwd }
@@ -268,6 +297,57 @@ impl<'a> SupervisorService<'a> {
         let _lock = lock_supervisor_state(&state_path)?;
         let mut state = self.build_state()?;
         preserve_persisted_restart_requests(&state_path, &mut state);
+        if let Some(parent) = state_path.parent() {
+            ensure_dir(parent)?;
+        }
+        ensure_dir(&supervisor_logs_dir(self.env, self.cwd)?)?;
+        write_json(&state_path, &state)?;
+        Ok(view_from_state(&state_path, true, state))
+    }
+
+    fn sync_env(&self, env_name: &str) -> Result<SupervisorView, String> {
+        self.sync_targeted(|_, _| BTreeSet::from([env_name.to_string()]))
+    }
+
+    fn sync_binding(
+        &self,
+        binding_kind: &str,
+        binding_name: &str,
+    ) -> Result<SupervisorView, String> {
+        self.sync_targeted(|fresh_state, persisted_state| {
+            fresh_state
+                .children
+                .iter()
+                .chain(
+                    persisted_state
+                        .into_iter()
+                        .flat_map(|state| state.children.iter()),
+                )
+                .filter(|child| {
+                    child.binding_kind == binding_kind && child.binding_name == binding_name
+                })
+                .map(|child| child.env_name.clone())
+                .collect()
+        })
+    }
+
+    fn sync_targeted(
+        &self,
+        select_envs: impl FnOnce(&SupervisorState, Option<&SupervisorState>) -> BTreeSet<String>,
+    ) -> Result<SupervisorView, String> {
+        let state_path = supervisor_state_path(self.env, self.cwd)?;
+        let _lock = lock_supervisor_state(&state_path)?;
+        let mut state = self.build_state()?;
+        let persisted_state = read_json::<SupervisorState>(&state_path).ok();
+
+        if let Some(persisted_state) = persisted_state {
+            let refreshed_envs = select_envs(&state, Some(&persisted_state));
+            if refreshed_envs.is_empty() {
+                return Ok(view_from_state(&state_path, true, persisted_state));
+            }
+            merge_targeted_supervisor_state(&mut state, persisted_state, &refreshed_envs);
+        }
+
         if let Some(parent) = state_path.parent() {
             ensure_dir(parent)?;
         }
@@ -1005,6 +1085,42 @@ fn preserve_persisted_child_specs_except(
             *child = persisted_child.clone();
         }
     }
+}
+
+fn merge_targeted_supervisor_state(
+    fresh_state: &mut SupervisorState,
+    persisted_state: SupervisorState,
+    refreshed_envs: &BTreeSet<String>,
+) {
+    let mut children = persisted_state
+        .children
+        .into_iter()
+        .filter(|child| !refreshed_envs.contains(&child.env_name))
+        .collect::<Vec<_>>();
+    children.extend(
+        fresh_state
+            .children
+            .drain(..)
+            .filter(|child| refreshed_envs.contains(&child.env_name)),
+    );
+    children.sort_by(|left, right| left.env_name.cmp(&right.env_name));
+    fresh_state.children = children;
+
+    let mut skipped_envs = persisted_state
+        .skipped_envs
+        .into_iter()
+        .filter(|entry| !refreshed_envs.contains(&entry.env_name))
+        .collect::<Vec<_>>();
+    skipped_envs.extend(
+        fresh_state
+            .skipped_envs
+            .drain(..)
+            .filter(|entry| refreshed_envs.contains(&entry.env_name)),
+    );
+    skipped_envs.sort_by(|left, right| left.env_name.cmp(&right.env_name));
+    fresh_state.skipped_envs = skipped_envs;
+
+    preserve_restart_requests(fresh_state, persisted_state.restart_requests);
 }
 
 fn preserve_restart_requests(
@@ -2255,6 +2371,111 @@ mod tests {
             skipped_envs: Vec::new(),
             restart_requests,
         }
+    }
+
+    #[test]
+    fn targeted_state_merge_preserves_unrelated_children_skips_and_requests() {
+        let mut persisted = supervisor_state(vec![SupervisorRestartRequest {
+            env_name: "sibling".to_string(),
+            request_id: "restart-sibling".to_string(),
+        }]);
+        persisted.children.push(child_spec("sibling", 20_001));
+        persisted.skipped_envs.push(SkippedSupervisorEnv {
+            env_name: "persisted-skipped".to_string(),
+            reason: "persisted reason".to_string(),
+        });
+
+        let mut fresh = supervisor_state(Vec::new());
+        fresh.children[0].runtime_release_version = Some("2.0.0".to_string());
+        let mut drifted_sibling = child_spec("sibling", 30_001);
+        drifted_sibling.runtime_release_version = Some("latent-drift".to_string());
+        fresh.children.push(drifted_sibling);
+        fresh.children.push(child_spec("new-unrelated", 30_002));
+        fresh.skipped_envs.push(SkippedSupervisorEnv {
+            env_name: "new-skipped".to_string(),
+            reason: "fresh reason".to_string(),
+        });
+
+        merge_targeted_supervisor_state(
+            &mut fresh,
+            persisted,
+            &BTreeSet::from(["demo".to_string()]),
+        );
+
+        assert_eq!(fresh.children.len(), 2);
+        assert_eq!(
+            active_child_spec(&fresh, "demo")
+                .unwrap()
+                .runtime_release_version,
+            Some("2.0.0".to_string())
+        );
+        let sibling = active_child_spec(&fresh, "sibling").unwrap();
+        assert_eq!(sibling.child_port, 20_001);
+        assert_eq!(sibling.runtime_release_version, Some("1.0.0".to_string()));
+        assert!(active_child_spec(&fresh, "new-unrelated").is_none());
+        assert_eq!(
+            fresh.skipped_envs,
+            vec![SkippedSupervisorEnv {
+                env_name: "persisted-skipped".to_string(),
+                reason: "persisted reason".to_string(),
+            }]
+        );
+        assert_eq!(
+            fresh.restart_requests,
+            vec![SupervisorRestartRequest {
+                env_name: "sibling".to_string(),
+                request_id: "restart-sibling".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn targeted_state_merge_can_replace_a_child_with_a_skipped_target() {
+        let mut persisted = supervisor_state(vec![
+            SupervisorRestartRequest {
+                env_name: "demo".to_string(),
+                request_id: "restart-demo".to_string(),
+            },
+            SupervisorRestartRequest {
+                env_name: "sibling".to_string(),
+                request_id: "restart-sibling".to_string(),
+            },
+        ]);
+        persisted.children.push(child_spec("sibling", 20_001));
+
+        let mut fresh = supervisor_state(Vec::new());
+        fresh.children.retain(|child| child.env_name != "demo");
+        fresh.children.push(child_spec("sibling", 30_001));
+        fresh.skipped_envs.push(SkippedSupervisorEnv {
+            env_name: "demo".to_string(),
+            reason: "service is stopped".to_string(),
+        });
+
+        merge_targeted_supervisor_state(
+            &mut fresh,
+            persisted,
+            &BTreeSet::from(["demo".to_string()]),
+        );
+
+        assert!(active_child_spec(&fresh, "demo").is_none());
+        assert_eq!(
+            active_child_spec(&fresh, "sibling").unwrap().child_port,
+            20_001
+        );
+        assert_eq!(
+            fresh.skipped_envs,
+            vec![SkippedSupervisorEnv {
+                env_name: "demo".to_string(),
+                reason: "service is stopped".to_string(),
+            }]
+        );
+        assert_eq!(
+            fresh.restart_requests,
+            vec![SupervisorRestartRequest {
+                env_name: "sibling".to_string(),
+                request_id: "restart-sibling".to_string(),
+            }]
+        );
     }
 
     fn exited_child(

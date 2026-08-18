@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 use crate::store::{
     add_runtime, get_runtime_verified, list_runtimes, remove_runtime, with_locked_environments,
 };
-use crate::supervisor::sync_supervisor_if_present;
+use crate::supervisor::sync_supervisor_binding_if_present;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -114,8 +114,8 @@ impl<'a> RuntimeService<'a> {
         })
     }
 
-    pub(crate) fn refresh_supervisor_if_present(&self) -> Result<(), String> {
-        sync_supervisor_if_present(self.env, self.cwd)?;
+    pub(crate) fn refresh_supervisor_if_present(&self, name: &str) -> Result<(), String> {
+        sync_supervisor_binding_if_present(self.env, self.cwd, "runtime", name)?;
         Ok(())
     }
 
@@ -126,7 +126,7 @@ impl<'a> RuntimeService<'a> {
     pub fn add(&self, options: AddRuntimeOptions) -> Result<RuntimeMeta, String> {
         let name = options.name.clone();
         let meta = self.with_unbound_runtime(&name, || add_runtime(options, self.env, self.cwd))?;
-        self.refresh_supervisor_if_present()?;
+        self.refresh_supervisor_if_present(&name)?;
         Ok(meta)
     }
 
@@ -140,7 +140,7 @@ impl<'a> RuntimeService<'a> {
 
     pub fn remove(&self, name: &str) -> Result<RuntimeMeta, String> {
         let meta = self.with_unbound_runtime(name, || remove_runtime(name, self.env, self.cwd))?;
-        self.refresh_supervisor_if_present()?;
+        self.refresh_supervisor_if_present(name)?;
         Ok(meta)
     }
 }
