@@ -1701,6 +1701,7 @@ fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
         ],
     );
     assert!(start.status.success(), "{}", stderr(&start));
+    env.insert("OCM_TEST_NPM_CHUNK_COUNT".to_string(), "2000".to_string());
     let install_target = run_ocm(
         &cwd,
         &env,
@@ -1712,6 +1713,7 @@ fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
         stdout(&install_target),
         stderr(&install_target)
     );
+    env.remove("OCM_TEST_NPM_CHUNK_COUNT");
 
     let target = run_ocm(&cwd, &env, &["runtime", "show", target_version, "--json"]);
     assert!(target.status.success(), "{}", stderr(&target));
@@ -1720,14 +1722,6 @@ fn failed_named_runtime_target_in_backoff_is_not_rewritten_during_rollback() {
     let target_entrypoint = target_root.join("files/node_modules/openclaw/openclaw.mjs");
     let target_host_root = target_root.join("files/node_modules/openclaw");
     let target_chunks = target_root.join("files/node_modules/openclaw/dist/chunks");
-    fs::create_dir_all(&target_chunks).unwrap();
-    for index in 0..2_000 {
-        fs::write(
-            target_chunks.join(format!("chunk-{index:04}.js")),
-            format!("export const chunk{index} = {index};\n"),
-        )
-        .unwrap();
-    }
     let watched_chunk = target_chunks.join("chunk-1000.js");
     let entrypoint_hash_before = Sha512::digest(fs::read(&target_entrypoint).unwrap()).to_vec();
     let entrypoint_inode_before = fs::metadata(&target_entrypoint).unwrap().ino();
@@ -2238,6 +2232,10 @@ fn upgrade_switches_across_versions_from_runtime_with_broken_package_bin_symlink
 
     for (index, (source_version, target_version)) in pairs.iter().enumerate() {
         let env_name = format!("demo-{index}");
+        env.insert(
+            "OCM_TEST_NPM_BROKEN_BIN_INDEX".to_string(),
+            index.to_string(),
+        );
         let start = run_ocm(
             &cwd,
             &env,
@@ -2250,6 +2248,7 @@ fn upgrade_switches_across_versions_from_runtime_with_broken_package_bin_symlink
             ],
         );
         assert!(start.status.success(), "{}", stderr(&start));
+        env.remove("OCM_TEST_NPM_BROKEN_BIN_INDEX");
 
         let runtime = run_ocm(&cwd, &env, &["runtime", "show", source_version, "--json"]);
         assert!(runtime.status.success(), "{}", stderr(&runtime));
@@ -2258,9 +2257,7 @@ fn upgrade_switches_across_versions_from_runtime_with_broken_package_bin_symlink
         let bin_dir = install_root.join(format!(
             "files/node_modules/openclaw/dist/extensions/demo-{index}/node_modules/.bin"
         ));
-        fs::create_dir_all(&bin_dir).unwrap();
         let broken_link = bin_dir.join("missing-tool");
-        std::os::unix::fs::symlink("../missing-package/bin/missing-tool", &broken_link).unwrap();
         assert!(
             fs::symlink_metadata(&broken_link)
                 .unwrap()

@@ -11,6 +11,7 @@ use crate::infra::download::{
     artifact_file_name_from_url, download_to_file, file_sha256, normalize_file_integrity,
     normalize_sha256, verify_file_integrity, verify_file_sha256,
 };
+use crate::infra::tree_digest::tree_sha256;
 use crate::managed_node::{CommandSpec, managed_runtime_install_command};
 use crate::openclaw_repo::ensure_checkout_owned_dependencies;
 use crate::runtime::releases::{
@@ -340,7 +341,7 @@ pub(crate) struct OfficialRuntimeInstallResult {
 
 enum OfficialRuntimeInstallTarget {
     Install(RuntimeInstallTarget),
-    Reuse(RuntimeMeta),
+    Reuse(Box<RuntimeMeta>),
 }
 
 impl Drop for RuntimeInstallTarget {
@@ -1350,6 +1351,7 @@ fn build_installed_runtime_meta(
     target: &RuntimeInstallTarget,
     binary_path: &Path,
     source: &RuntimeSourceDetails,
+    runtime_sha256: Option<String>,
     release: &RuntimeReleaseDetails,
     description: Option<String>,
 ) -> RuntimeMeta {
@@ -1368,6 +1370,7 @@ fn build_installed_runtime_meta(
         source_manifest_url: source.manifest_url.clone(),
         source_sha256: source.sha256.clone(),
         source_integrity: source.integrity.clone(),
+        runtime_sha256,
         release_version: release.version.clone(),
         release_channel: release.channel.clone(),
         release_selector_kind: release.selector_kind.clone(),
@@ -1427,8 +1430,14 @@ fn prepare_runtime_at_path(
             (None, None) => return Err("runtime install requires a source path or URL".to_string()),
         }
 
-        let meta =
-            build_installed_runtime_meta(&target, &binary_path, &source, &release, description);
+        let meta = build_installed_runtime_meta(
+            &target,
+            &binary_path,
+            &source,
+            None,
+            &release,
+            description,
+        );
         Ok(PreparedRuntimeInstall {
             target: Some(target),
             meta,
@@ -1498,7 +1507,7 @@ fn prepare_official_runtime_install_target(
             && existing.source_manifest_url == source.manifest_url
             && existing.source_integrity == source.integrity;
         if same_release && runtime_integrity_issue(&existing, context.env).is_none() {
-            return Ok(OfficialRuntimeInstallTarget::Reuse(existing));
+            return Ok(OfficialRuntimeInstallTarget::Reuse(Box::new(existing)));
         }
         return Err(format!("runtime \"{name}\" already exists"));
     }
@@ -1609,6 +1618,7 @@ fn stage_runtime_from_openclaw_package_archive(
         fs::set_permissions(&binary_path, permissions).map_err(|error| error.to_string())?;
     }
     let binary_sha256 = file_sha256(&binary_path)?;
+    let runtime_sha256 = tree_sha256(&target.install_files.join("node_modules"))?;
 
     let mut source = source;
     source.sha256 = Some(binary_sha256);
@@ -1616,6 +1626,7 @@ fn stage_runtime_from_openclaw_package_archive(
         target,
         &binary_path,
         &source,
+        Some(runtime_sha256),
         &release,
         description,
     ))
@@ -1778,6 +1789,7 @@ pub fn add_runtime(
         source_manifest_url: None,
         source_sha256: None,
         source_integrity: None,
+        runtime_sha256: None,
         release_version: None,
         release_channel: None,
         release_selector_kind: None,
@@ -2226,7 +2238,7 @@ pub(crate) fn prepare_runtime_from_selected_official_openclaw_release(
     match prepare_official_runtime_install_target(name, force, &source, &release, context)? {
         OfficialRuntimeInstallTarget::Reuse(meta) => Ok(PreparedRuntimeInstall {
             target: None,
-            meta,
+            meta: *meta,
             reused: true,
         }),
         OfficialRuntimeInstallTarget::Install(target) => {
@@ -2235,10 +2247,7 @@ pub(crate) fn prepare_runtime_from_selected_official_openclaw_release(
     }
 }
 
-pub fn runtime_integrity_issue(
-    meta: &RuntimeMeta,
-    env: &BTreeMap<String, String>,
-) -> Option<String> {
+fn runtime_execution_issue(meta: &RuntimeMeta, env: &BTreeMap<String, String>) -> Option<String> {
     let binary_path = Path::new(&meta.binary_path);
     if !path_exists(binary_path) {
         return Some(format!(
@@ -2258,25 +2267,58 @@ pub fn runtime_integrity_issue(
         ));
     }
 
-    let expected_sha256 = meta.source_sha256.as_deref()?;
-    let expected_sha256 = match normalize_sha256(expected_sha256) {
-        Ok(value) => value,
-        Err(error) => return Some(error),
-    };
-    let actual_sha256 = match file_sha256(binary_path) {
-        Ok(value) => value,
-        Err(error) => return Some(error),
-    };
-    if actual_sha256 != expected_sha256 {
-        return Some(format!(
-            "sha256 mismatch: expected {expected_sha256}, got {actual_sha256}"
-        ));
+    if let Some(expected_sha256) = meta.source_sha256.as_deref() {
+        let expected_sha256 = match normalize_sha256(expected_sha256) {
+            Ok(value) => value,
+            Err(error) => return Some(error),
+        };
+        let actual_sha256 = match file_sha256(binary_path) {
+            Ok(value) => value,
+            Err(error) => return Some(error),
+        };
+        if actual_sha256 != expected_sha256 {
+            return Some(format!(
+                "sha256 mismatch: expected {expected_sha256}, got {actual_sha256}"
+            ));
+        }
     }
 
     if (is_official_openclaw_package_runtime(meta, env) || is_openclaw_package_runtime(meta))
         && let Some(package_root) = openclaw_package_root_from_binary(binary_path)
+        && let Some(issue) = openclaw_package_runtime_dependency_layout_issue(&package_root)
     {
-        return openclaw_package_runtime_dependency_layout_issue(&package_root);
+        return Some(issue);
+    }
+
+    None
+}
+
+pub fn runtime_integrity_issue(
+    meta: &RuntimeMeta,
+    env: &BTreeMap<String, String>,
+) -> Option<String> {
+    if let Some(issue) = runtime_execution_issue(meta, env) {
+        return Some(issue);
+    }
+
+    if let Some(expected_runtime_sha256) = meta.runtime_sha256.as_deref() {
+        let expected_runtime_sha256 = match normalize_sha256(expected_runtime_sha256) {
+            Ok(value) => value,
+            Err(error) => return Some(error),
+        };
+        let Some(install_root) = meta.install_root.as_deref() else {
+            return Some("runtime sha256 requires an install root".to_string());
+        };
+        let runtime_root = Path::new(install_root).join("files/node_modules");
+        let actual_runtime_sha256 = match tree_sha256(&runtime_root) {
+            Ok(value) => value,
+            Err(error) => return Some(error),
+        };
+        if actual_runtime_sha256 != expected_runtime_sha256 {
+            return Some(format!(
+                "runtime sha256 mismatch: expected {expected_runtime_sha256}, got {actual_runtime_sha256}"
+            ));
+        }
     }
 
     None
@@ -2286,7 +2328,7 @@ pub fn verify_runtime_binary(
     meta: RuntimeMeta,
     env: &BTreeMap<String, String>,
 ) -> Result<RuntimeMeta, String> {
-    if let Some(issue) = runtime_integrity_issue(&meta, env) {
+    if let Some(issue) = runtime_execution_issue(&meta, env) {
         return Err(format!("runtime \"{}\" {issue}", meta.name));
     }
 
