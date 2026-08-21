@@ -13,7 +13,7 @@ use ocm::supervisor::{SupervisorService, sync_supervisor_binding_if_present};
 use serde_json::{Value, to_value};
 
 use crate::support::{
-    TestDir, install_fake_systemd_tools, ocm_env, path_string, run_ocm, stderr,
+    TestDir, install_fake_systemd_tools, ocm_env, path_string, run_ocm, stderr, stdout,
     write_executable_script,
 };
 
@@ -1062,7 +1062,264 @@ fn targeted_runtime_refresh_ignores_unrelated_drift_and_restarts_effective_chang
 }
 
 #[test]
-fn service_restart_restarts_only_the_target_child() {
+fn service_uninstall_removes_only_target_child_despite_unrelated_drift() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-targeted-service-uninstall");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_systemd_tools(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    let target_started = root.child("target-started.txt");
+    let target_stopped = root.child("target-stopped.txt");
+    let sibling_started = root.child("sibling-started.txt");
+    let sibling_stopped = root.child("sibling-stopped.txt");
+
+    let target_runtime = root.child("bin/target-runtime");
+    write_legacy_openclaw_script(
+        &target_runtime,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            path_string(&target_started),
+            path_string(&target_stopped),
+        ),
+    );
+    let sibling_runtime = root.child("bin/sibling-runtime");
+    write_legacy_openclaw_script(
+        &sibling_runtime,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            path_string(&sibling_started),
+            path_string(&sibling_stopped),
+        ),
+    );
+
+    for (runtime_name, runtime_path, env_name) in [
+        ("target-runtime", &target_runtime, "target"),
+        ("sibling-runtime", &sibling_runtime, "sibling"),
+    ] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                runtime_name,
+                "--path",
+                &path_string(runtime_path),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", env_name, "--runtime", runtime_name],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        set_service_enabled(&cwd, &env, env_name, true);
+    }
+    service.sync().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
+        .expect("daemon runtime state did not report both children");
+    let target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
+    let sibling_pid = runtime_child_pid(&initial_runtime, "sibling").unwrap();
+
+    let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
+    let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
+    sibling_meta["releaseVersion"] = Value::String("latent-sibling-v2".to_string());
+    write_persisted_service_state(&sibling_meta_path, &sibling_meta);
+
+    let uninstall = run_ocm(&cwd, &env, &["service", "uninstall", "target", "--json"]);
+    assert!(uninstall.status.success(), "{}", stderr(&uninstall));
+
+    let final_runtime =
+        wait_for_runtime_children(&runtime_path, 1, Some("sibling"), Duration::from_secs(5))
+            .expect("daemon runtime state did not retain only the sibling");
+    let final_state = read_persisted_service_state(&state_path);
+    let persisted_sibling = final_state["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["envName"] == "sibling")
+        .unwrap();
+
+    assert_eq!(
+        runtime_child_pid(&final_runtime, "sibling"),
+        Some(sibling_pid),
+        "sibling child PID changed"
+    );
+    assert_ne!(
+        runtime_child_pid(&final_runtime, "target"),
+        Some(target_pid),
+        "target child remained active"
+    );
+    assert!(wait_for_file(&target_stopped, Duration::from_secs(5)));
+    assert!(
+        !sibling_stopped.exists(),
+        "sibling child was stopped by target uninstall"
+    );
+    assert_eq!(
+        fs::read_to_string(&sibling_started)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "sibling child restarted"
+    );
+    assert!(
+        persisted_sibling["runtimeReleaseVersion"].is_null(),
+        "target uninstall applied unrelated sibling drift"
+    );
+
+    stop_process(&mut daemon);
+}
+
+#[test]
+fn env_destroy_removes_only_target_child_despite_unrelated_drift() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-targeted-env-destroy");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    install_fake_systemd_tools(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    let target_started = root.child("target-started.txt");
+    let target_stopped = root.child("target-stopped.txt");
+    let sibling_started = root.child("sibling-started.txt");
+    let sibling_stopped = root.child("sibling-stopped.txt");
+
+    let target_runtime = root.child("bin/target-runtime");
+    write_legacy_openclaw_script(
+        &target_runtime,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            path_string(&target_started),
+            path_string(&target_stopped),
+        ),
+    );
+    let sibling_runtime = root.child("bin/sibling-runtime");
+    write_legacy_openclaw_script(
+        &sibling_runtime,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            path_string(&sibling_started),
+            path_string(&sibling_stopped),
+        ),
+    );
+
+    for (runtime_name, runtime_path, env_name) in [
+        ("target-runtime", &target_runtime, "target"),
+        ("sibling-runtime", &sibling_runtime, "sibling"),
+    ] {
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                runtime_name,
+                "--path",
+                &path_string(runtime_path),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", env_name, "--runtime", runtime_name],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        set_service_enabled(&cwd, &env, env_name, true);
+    }
+    service.sync().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
+        .expect("daemon runtime state did not report both children");
+    let target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
+    let sibling_pid = runtime_child_pid(&initial_runtime, "sibling").unwrap();
+
+    let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
+    let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
+    sibling_meta["releaseVersion"] = Value::String("latent-sibling-v2".to_string());
+    write_persisted_service_state(&sibling_meta_path, &sibling_meta);
+
+    let preview = run_ocm(&cwd, &env, &["env", "destroy", "target", "--json"]);
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    let preview_json: Value = serde_json::from_str(&stdout(&preview)).unwrap();
+    let state_token = preview_json["stateToken"].as_str().unwrap();
+    let destroy = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "destroy",
+            "target",
+            "--yes",
+            "--if-state-token",
+            state_token,
+            "--json",
+        ],
+    );
+    assert!(destroy.status.success(), "{}", stderr(&destroy));
+
+    let final_runtime =
+        wait_for_runtime_children(&runtime_path, 1, Some("sibling"), Duration::from_secs(5))
+            .expect("daemon runtime state did not retain only the sibling");
+    let final_state = read_persisted_service_state(&state_path);
+    let persisted_sibling = final_state["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["envName"] == "sibling")
+        .unwrap();
+
+    assert_eq!(
+        runtime_child_pid(&final_runtime, "sibling"),
+        Some(sibling_pid),
+        "sibling child PID changed"
+    );
+    assert_ne!(
+        runtime_child_pid(&final_runtime, "target"),
+        Some(target_pid),
+        "target child remained active"
+    );
+    assert!(wait_for_file(&target_stopped, Duration::from_secs(5)));
+    assert!(
+        !sibling_stopped.exists(),
+        "sibling child was stopped by target environment destroy"
+    );
+    assert_eq!(
+        fs::read_to_string(&sibling_started)
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "sibling child restarted"
+    );
+    assert!(
+        persisted_sibling["runtimeReleaseVersion"].is_null(),
+        "target environment destroy applied unrelated sibling drift"
+    );
+    assert!(
+        EnvironmentService::new(&env, &cwd)
+            .find("target")
+            .unwrap()
+            .is_none(),
+        "target environment metadata remained after destroy"
+    );
+
+    stop_process(&mut daemon);
+}
+
+#[test]
+fn service_restart_preserves_legacy_fallback_and_restarts_only_the_target_child() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("daemon-targeted-service-restart");
     let cwd = root.child("workspace");
@@ -1156,6 +1413,17 @@ fn service_restart_restarts_only_the_target_child() {
         &["service", "restart", "rescue", "--json"],
     );
     assert!(restart.status.success(), "{}", stderr(&restart));
+    let restart_body: serde_json::Value = serde_json::from_slice(&restart.stdout).unwrap();
+    assert!(
+        restart_body["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .unwrap()
+                .contains("used the legacy direct supervisor restart path"))
+    );
     let restarted = wait_for_runtime_child_pid_change(
         &runtime_path,
         "rescue",
@@ -1220,7 +1488,11 @@ fn service_restart_requeues_a_stopped_desired_child() {
         .expect("daemon runtime state did not report the quick clean exit as stopped");
     assert!(!started.exists());
 
-    let restart = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
+    let restart = run_ocm(
+        &cwd,
+        &env,
+        &["service", "restart", "demo", "--force", "--json"],
+    );
     assert!(restart.status.success(), "{}", stderr(&restart));
     let runtime =
         wait_for_runtime_children(&runtime_path, 1, Some("demo"), Duration::from_secs(10))
@@ -1236,7 +1508,7 @@ fn service_restart_requeues_a_stopped_desired_child() {
 fn service_start_and_restart_wait_for_gateway_health() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("service-readiness-healthy");
-    let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
+    let (cwd, mut env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
     let mut daemon = spawn_daemon_process(&cwd, &env);
 
     let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
@@ -1246,6 +1518,7 @@ fn service_start_and_restart_wait_for_gateway_health() {
     assert_eq!(started_body["gatewayState"], "running");
     assert_eq!(started_body["issue"], Value::Null);
 
+    env.insert("OCM_ACTIVE_ENV".to_string(), "demo".to_string());
     let restarted = run_ocm(&cwd, &env, &["service", "restart", "demo", "--json"]);
     assert!(restarted.status.success(), "{}", stderr(&restarted));
     let restarted_body: Value = serde_json::from_slice(&restarted.stdout).unwrap();
@@ -1512,6 +1785,62 @@ fn daemon_stops_the_full_dev_process_tree_after_service_stop() {
     assert!(
         !process_exists(child_pid),
         "background descendant still alive after service stop"
+    );
+
+    stop_process(&mut daemon);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_cleans_descendants_after_a_child_exits_before_restart() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-exit-process-group-cleanup");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = ocm_env(&root);
+    let service = SupervisorService::new(&env, &cwd);
+
+    let starts = root.child("starts.txt");
+    let descendant_pid_file = root.child("descendant.pid");
+    let script = root.child("bin/openclaw.mjs");
+    write_legacy_openclaw_script(
+        &script,
+        &format!(
+            "#!/bin/sh\ncount=0\nif [ -f '{starts}' ]; then count=$(cat '{starts}'); fi\ncount=$((count + 1))\nprintf '%s\n' \"$count\" > '{starts}'\nif [ \"$count\" -eq 1 ]; then\n  trap '' HUP\n  sleep 60 &\n  printf '%s\n' \"$!\" > '{descendant_pid_file}'\n  sleep 1\n  exit 1\nfi\nsleep 10\n",
+            starts = path_string(&starts),
+            descendant_pid_file = path_string(&descendant_pid_file),
+        ),
+    );
+
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &["launcher", "add", "dev", "--command", &path_string(&script)],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+
+    let created = run_ocm(&cwd, &env, &["env", "create", "demo", "--launcher", "dev"]);
+    assert!(created.status.success(), "{}", stderr(&created));
+    set_service_enabled(&cwd, &env, "demo", true);
+    service.sync().unwrap();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    assert!(wait_for_file(&descendant_pid_file, Duration::from_secs(5)));
+    let descendant_pid = fs::read_to_string(&descendant_pid_file)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert!(process_exists(descendant_pid));
+
+    assert!(wait_for_file_value(&starts, "2", Duration::from_secs(5)));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && process_exists(descendant_pid) {
+        sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !process_exists(descendant_pid),
+        "background descendant still alive after supervised child exit"
     );
 
     stop_process(&mut daemon);

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -56,8 +56,7 @@ const SERVICE_PROXY_ENV_KEYS: [&str; 8] = [
     "all_proxy",
 ];
 const SERVICE_EXTRA_ENV_KEYS: [&str; 2] = ["NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA"];
-const SUPERVISED_CHILD_BASE_ENV_KEYS: [&str; 6] =
-    ["HOME", "PATH", "TMPDIR", "OCM_HOME", "OCM_SELF", "SHELL"];
+const SUPERVISED_CHILD_BASE_ENV_KEYS: [&str; 5] = ["HOME", "PATH", "OCM_HOME", "OCM_SELF", "SHELL"];
 const SUPERVISED_CHILD_RUNTIME_ENV_KEYS: [&str; 4] =
     ["NODE_OPTIONS", "NODE_ENV", "NODE_PATH", "PNPM_HOME"];
 const SERVICE_EXECUTABLE_OVERRIDE: &str = "OCM_SERVICE_EXECUTABLE";
@@ -1034,6 +1033,11 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
                 spec.env_name
             )
         })?;
+    let mut process_env = spec.process_env.clone();
+    process_env.insert(
+        "TMPDIR".to_string(),
+        display_path(&prepare_supervisor_child_tmpdir()?),
+    );
 
     let mut command = Command::new(program);
     command
@@ -1042,7 +1046,7 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .env_clear()
-        .envs(&spec.process_env)
+        .envs(&process_env)
         .current_dir(Path::new(&spec.run_dir));
     #[cfg(unix)]
     {
@@ -1055,6 +1059,74 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
             child_binding_label(spec)
         )
     })
+}
+
+fn prepare_supervisor_child_tmpdir() -> Result<PathBuf, String> {
+    let preferred = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_dir());
+    if let Some(preferred) = preferred
+        && let Ok(path) = ensure_supervisor_child_tmpdir(&preferred)
+    {
+        return Ok(path);
+    }
+
+    #[cfg(unix)]
+    let fallback = PathBuf::from("/tmp");
+    #[cfg(not(unix))]
+    let fallback = std::env::temp_dir();
+    ensure_supervisor_child_tmpdir(&fallback)
+}
+
+fn ensure_supervisor_child_tmpdir(base: &Path) -> Result<PathBuf, String> {
+    if !base.is_absolute() || !base.is_dir() {
+        return Err(format!(
+            "temporary directory base is unavailable: {}",
+            display_path(base)
+        ));
+    }
+
+    let path = base.join(format!("ocm-supervisor-{}", std::process::id()));
+    match fs::create_dir(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "failed creating supervised child temporary directory {}: {error}",
+                display_path(&path)
+            ));
+        }
+    }
+
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "failed inspecting supervised child temporary directory {}: {error}",
+            display_path(&path)
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(format!(
+            "supervised child temporary path is not a directory: {}",
+            display_path(&path)
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let current_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != current_uid {
+            return Err(format!(
+                "supervised child temporary directory is not owned by the current user: {}",
+                display_path(&path)
+            ));
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!(
+                "failed securing supervised child temporary directory {}: {error}",
+                display_path(&path)
+            )
+        })?;
+    }
+    Ok(path)
 }
 
 fn supervisor_program_arguments(spec: &SupervisorChildSpec) -> Vec<String> {
@@ -1482,9 +1554,10 @@ fn process_exited_children(
     let mut runtime_dirty = false;
 
     for exited_child in exited {
-        let Some(previous_child) = running.remove(&exited_child.env_name) else {
+        let Some(mut previous_child) = running.remove(&exited_child.env_name) else {
             continue;
         };
+        stop_supervisor_child(&mut previous_child);
         runtime_dirty = true;
         results.push(child_run_result(
             &previous_child.spec,
@@ -1811,20 +1884,46 @@ fn stop_supervisor_child(running_child: &mut RunningSupervisorChild) {
         let process_group = format!("-{}", running_child.child.id());
         let _ = Command::new("kill")
             .args(["-TERM", "--", &process_group])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
         for _ in 0..20 {
-            match running_child.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => sleep(Duration::from_millis(50)),
-                Err(_) => break,
+            let _ = running_child.child.try_wait();
+            if !supervisor_process_group_exists(&process_group) {
+                break;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        if supervisor_process_group_exists(&process_group) {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &process_group])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            for _ in 0..20 {
+                let _ = running_child.child.try_wait();
+                if !supervisor_process_group_exists(&process_group) {
+                    break;
+                }
+                sleep(Duration::from_millis(50));
             }
         }
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &process_group])
-            .status();
     }
+    // Always wait on the process-group leader. It can exit after try_wait()
+    // reports None but before the group-existence probe; returning in that
+    // window leaves a zombie that can block OpenClaw's single-instance lock.
     let _ = running_child.child.kill();
     let _ = running_child.child.wait();
+}
+
+#[cfg(unix)]
+fn supervisor_process_group_exists(process_group: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", "--", process_group])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn supervisor_state_equivalent(left: &SupervisorState, right: &SupervisorState) -> bool {
@@ -1984,12 +2083,6 @@ fn supervisor_service_environment(
             .map(|value| value.trim().to_string())
             .unwrap_or_else(|| DEFAULT_SERVICE_PATH.to_string()),
     );
-    if let Some(tmpdir) = process_env
-        .get("TMPDIR")
-        .filter(|value| !value.trim().is_empty())
-    {
-        service_env.insert("TMPDIR".to_string(), tmpdir.trim().to_string());
-    }
     for key in SERVICE_PROXY_ENV_KEYS {
         if let Some(value) = process_env
             .get(key)
@@ -2915,6 +3008,94 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exited_supervisor_child_cleans_remaining_process_group() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "ocm-supervisor-process-group-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&test_dir).unwrap();
+        let descendant_pid_path = test_dir.join("descendant.pid");
+        let mut spec = child_spec("process-group-cleanup", 19_999);
+        spec.command = Some(
+            "trap '' HUP; sleep 60 & descendant=$!; printf '%s' \"$descendant\" > \"$OCM_TEST_DESCENDANT_PID_FILE\"; exit 1"
+                .to_string(),
+        );
+        spec.binary_path = None;
+        spec.run_dir = test_dir.to_string_lossy().into_owned();
+        spec.stdout_path = test_dir.join("stdout.log").to_string_lossy().into_owned();
+        spec.stderr_path = test_dir.join("stderr.log").to_string_lossy().into_owned();
+        spec.process_env.insert(
+            "OCM_TEST_DESCENDANT_PID_FILE".to_string(),
+            descendant_pid_path.to_string_lossy().into_owned(),
+        );
+
+        let mut running_child = spawn_running_child(spec, 0, 0).unwrap();
+        let process_group = format!("-{}", running_child.child.id());
+        let status = running_child.child.wait().unwrap();
+        assert_eq!(status.code(), Some(1));
+
+        for _ in 0..100 {
+            if descendant_pid_path.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(10));
+        }
+        let descendant_pid = fs::read_to_string(&descendant_pid_path).unwrap();
+        assert!(supervisor_process_group_exists(&process_group));
+
+        stop_supervisor_child(&mut running_child);
+
+        for _ in 0..100 {
+            let descendant_alive = Command::new("kill")
+                .args(["-0", "--", descendant_pid.trim()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !descendant_alive {
+                break;
+            }
+            sleep(Duration::from_millis(10));
+        }
+        assert!(!supervisor_process_group_exists(&process_group));
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopped_supervisor_child_reaps_process_group_leader() {
+        let test_dir = std::env::temp_dir().join(format!(
+            "ocm-supervisor-child-reap-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&test_dir).unwrap();
+        let mut spec = child_spec("process-group-leader-reap", 19_998);
+        spec.command = Some("trap 'exit 0' TERM; while :; do sleep 1; done".to_string());
+        spec.binary_path = None;
+        spec.run_dir = test_dir.to_string_lossy().into_owned();
+        spec.stdout_path = test_dir.join("stdout.log").to_string_lossy().into_owned();
+        spec.stderr_path = test_dir.join("stderr.log").to_string_lossy().into_owned();
+
+        let mut running_child = spawn_running_child(spec, 0, 0).unwrap();
+        let child_pid = running_child.child.id().to_string();
+        sleep(Duration::from_millis(50));
+
+        stop_supervisor_child(&mut running_child);
+
+        let child_still_exists = Command::new("kill")
+            .args(["-0", "--", &child_pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(!child_still_exists, "supervised child was not reaped");
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
     #[test]
     fn restart_requests_are_part_of_supervisor_state_equivalence() {
         let active = supervisor_state(Vec::new());
@@ -3169,6 +3350,7 @@ mod tests {
             process_env.get("PATH").map(String::as_str),
             Some("/usr/bin:/bin")
         );
+        assert!(!process_env.contains_key("TMPDIR"));
         assert!(!process_env.contains_key("GH_TOKEN"));
         assert!(!process_env.contains_key("PWD"));
         assert!(!process_env.contains_key("XPC_SERVICE_NAME"));
