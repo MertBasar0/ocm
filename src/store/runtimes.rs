@@ -21,14 +21,16 @@ use crate::runtime::releases::{
     select_release,
 };
 use crate::runtime::{
-    AddRuntimeOptions, InstallRuntimeFromOfficialReleaseOptions, InstallRuntimeFromReleaseOptions,
-    InstallRuntimeFromUrlOptions, InstallRuntimeOptions, RuntimeMeta, RuntimeReleaseSelectorKind,
-    RuntimeSourceKind, is_official_openclaw_package_runtime, is_openclaw_package_runtime,
+    AddRuntimeOptions, INTERNAL_NPM_PROXY_REAL_BIN_ENV, INTERNAL_NPM_PROXY_WORKSPACE_DIRS_ENV,
+    INTERNAL_NPM_PROXY_WORKSPACE_VERSIONS_ENV, InstallRuntimeFromOfficialReleaseOptions,
+    InstallRuntimeFromReleaseOptions, InstallRuntimeFromUrlOptions, InstallRuntimeOptions,
+    RuntimeCompanionMeta, RuntimeMeta, RuntimeReleaseSelectorKind, RuntimeSourceKind,
+    is_official_openclaw_package_runtime, is_openclaw_package_runtime,
 };
 
 use super::common::{
-    ExclusiveFileLock, copy_dir_recursive, ensure_dir, load_json_files, lock_file, path_exists,
-    read_json, write_json,
+    ExclusiveFileLock, copy_dir_recursive, copy_path, ensure_dir, load_json_files, lock_file,
+    path_exists, read_json, write_json,
 };
 use super::envs::get_environment;
 use super::layout::{
@@ -360,6 +362,7 @@ pub(crate) struct InstallContext<'a> {
 pub struct BuildLocalRuntimeOptions {
     pub name: String,
     pub repo: String,
+    pub companions: Vec<String>,
     pub description: Option<String>,
     pub force: bool,
     pub include_source_extensions: bool,
@@ -388,7 +391,22 @@ fn configured_npm_program(env: &BTreeMap<String, String>) -> Option<String> {
 struct LocalBuildNpmAdapter {
     command: CommandSpec,
     real_npm: String,
+    npm_proxy: String,
     workspace_dependency_dirs: Option<OsString>,
+    workspace_dependency_versions: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalWorkspacePackage {
+    dir: PathBuf,
+    version: Option<String>,
+    workspace_dependencies: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalWorkspaceDependencyPlan {
+    dirs: OsString,
+    versions_json: String,
 }
 
 #[derive(Clone, Debug)]
@@ -421,11 +439,22 @@ struct SourcePluginInventory {
 
 impl LocalBuildNpmAdapter {
     fn apply_environment(&self, command: &mut Command) {
-        command.env("OPENCLAW_OCM_REAL_NPM_BIN", &self.real_npm);
+        command.env("OPENCLAW_OCM_REAL_NPM_BIN", &self.npm_proxy);
+        command.env(INTERNAL_NPM_PROXY_REAL_BIN_ENV, &self.real_npm);
         if let Some(workspace_dependency_dirs) = &self.workspace_dependency_dirs {
             command.env(
                 "OPENCLAW_OCM_WORKSPACE_DEPENDENCY_DIRS",
                 workspace_dependency_dirs,
+            );
+            command.env(
+                INTERNAL_NPM_PROXY_WORKSPACE_DIRS_ENV,
+                workspace_dependency_dirs,
+            );
+        }
+        if let Some(workspace_dependency_versions) = &self.workspace_dependency_versions {
+            command.env(
+                INTERNAL_NPM_PROXY_WORKSPACE_VERSIONS_ENV,
+                workspace_dependency_versions,
             );
         }
     }
@@ -756,7 +785,9 @@ fn resolve_target_source_plugin_closure(
     source_plugin_dependency_closure(direct, &inventory)
 }
 
-fn local_workspace_dependency_dirs(repo_path: &Path) -> Result<Option<OsString>, String> {
+fn local_workspace_dependency_plan(
+    repo_path: &Path,
+) -> Result<Option<LocalWorkspaceDependencyPlan>, String> {
     let package_json_path = repo_path.join("package.json");
     let raw = fs::read_to_string(&package_json_path).map_err(|error| {
         format!(
@@ -775,12 +806,19 @@ fn local_workspace_dependency_dirs(repo_path: &Path) -> Result<Option<OsString>,
     if pending.is_empty() {
         return Ok(None);
     }
-    let mut visited = root_package
+    let root_name = root_package
         .get("name")
         .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+        .unwrap_or("openclaw")
+        .to_string();
+    let root_version = root_package
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "OpenClaw package.json is missing a non-empty version".to_string())?
+        .to_string();
+    let mut visited = BTreeSet::from([root_name.clone()]);
 
     let mut packages = BTreeMap::new();
     for package_dir in local_workspace_package_dirs(repo_path)? {
@@ -799,27 +837,52 @@ fn local_workspace_dependency_dirs(repo_path: &Path) -> Result<Option<OsString>,
             .get("name")
             .and_then(serde_json::Value::as_str)
         {
-            packages.insert(name.to_string(), (package_dir, package_value));
+            packages.insert(
+                name.to_string(),
+                LocalWorkspacePackage {
+                    dir: package_dir,
+                    version: package_value
+                        .get("version")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                    workspace_dependencies: workspace_dependency_names(&package_value, true),
+                },
+            );
         }
     }
 
     let mut selected = BTreeMap::new();
+    let mut versions = BTreeMap::from([(root_name, root_version)]);
     while let Some(name) = pending.pop_first() {
         if !visited.insert(name.clone()) {
             continue;
         }
-        let (package_dir, package_value) = packages.get(&name).ok_or_else(|| {
+        let package = packages.get(&name).cloned().ok_or_else(|| {
             format!(
                 "OpenClaw workspace dependency \"{name}\" is not declared by pnpm-workspace.yaml"
             )
         })?;
-        selected.insert(name, package_dir.clone());
-        pending.extend(workspace_dependency_names(package_value, true));
+        let version = package.version.clone().ok_or_else(|| {
+            format!("selected OpenClaw workspace dependency \"{name}\" is missing a version")
+        })?;
+        pending.extend(package.workspace_dependencies.iter().cloned());
+        versions.insert(name.clone(), version);
+        selected.insert(name, package);
     }
 
-    std::env::join_paths(selected.into_values())
-        .map(Some)
-        .map_err(|error| format!("failed to encode OpenClaw workspace dependency paths: {error}"))
+    let dirs =
+        std::env::join_paths(selected.values().map(|package| &package.dir)).map_err(|error| {
+            format!("failed to encode OpenClaw workspace dependency paths: {error}")
+        })?;
+    let versions_json = serde_json::to_string(&versions).map_err(|error| {
+        format!("failed to encode OpenClaw workspace dependency versions: {error}")
+    })?;
+    Ok(Some(LocalWorkspaceDependencyPlan {
+        dirs,
+        versions_json,
+    }))
 }
 
 fn local_build_npm_adapter(
@@ -838,6 +901,9 @@ fn local_build_npm_adapter(
         return Ok(None);
     };
 
+    let workspace_dependencies = local_workspace_dependency_plan(repo_path)?;
+    let npm_proxy = std::env::current_exe()
+        .map_err(|error| format!("failed to resolve OCM npm proxy executable: {error}"))?;
     Ok(Some(LocalBuildNpmAdapter {
         command: CommandSpec {
             program: "node".to_string(),
@@ -845,7 +911,11 @@ fn local_build_npm_adapter(
             path_prepend: None,
         },
         real_npm: "npm".to_string(),
-        workspace_dependency_dirs: local_workspace_dependency_dirs(repo_path)?,
+        npm_proxy: display_path(&npm_proxy),
+        workspace_dependency_dirs: workspace_dependencies
+            .as_ref()
+            .map(|plan| plan.dirs.clone()),
+        workspace_dependency_versions: workspace_dependencies.map(|plan| plan.versions_json),
     }))
 }
 
@@ -973,6 +1043,441 @@ fn default_local_build_description(version: &str, commit: Option<&str>) -> Strin
         Some(commit) => format!("Local OpenClaw build {version} ({commit})"),
         None => format!("Local OpenClaw build {version}"),
     }
+}
+
+#[derive(Clone, Debug)]
+struct LocalCompanionSpec {
+    id: String,
+    directory_name: String,
+    package_name: String,
+    version: String,
+}
+
+#[derive(Clone, Debug)]
+struct PackedLocalCompanion {
+    spec: LocalCompanionSpec,
+    archive_path: PathBuf,
+}
+
+fn validate_local_companion_id(id: &str) -> Result<String, String> {
+    let id = id.trim();
+    let valid = !id.is_empty()
+        && id.bytes().all(|value| {
+            value.is_ascii_lowercase() || value.is_ascii_digit() || b"._-".contains(&value)
+        })
+        && id.as_bytes()[0].is_ascii_alphanumeric();
+    if !valid || id == "." || id == ".." {
+        return Err(format!(
+            "invalid local companion plugin id \"{id}\"; expected lowercase letters, digits, dots, underscores, or hyphens"
+        ));
+    }
+    Ok(id.to_string())
+}
+
+fn load_json_value(path: &Path, label: &str) -> Result<serde_json::Value, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {label} at {}: {error}", display_path(path)))?;
+    serde_json::from_str(&raw)
+        .map_err(|error| format!("failed to parse {label} at {}: {error}", display_path(path)))
+}
+
+fn load_local_companion_spec(
+    repo_path: &Path,
+    raw_id: &str,
+    openclaw_version: &str,
+) -> Result<LocalCompanionSpec, String> {
+    let id = validate_local_companion_id(raw_id)?;
+    let inventory = source_plugin_inventory(repo_path)?;
+    let companion = inventory.by_id.get(&id).ok_or_else(|| {
+        format!(
+            "local companion plugin id \"{id}\" does not exist under {}",
+            display_path(&repo_path.join("extensions"))
+        )
+    })?;
+    let package_dir = repo_path.join("extensions").join(&companion.directory_name);
+    let package = load_json_value(&package_dir.join("package.json"), "companion package.json")?;
+    let package_name = package
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("local companion \"{id}\" package.json is missing a name"))?;
+    let version = package
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("local companion \"{id}\" package.json is missing a version"))?;
+    let build_version = package
+        .pointer("/openclaw/build/openclawVersion")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!("local companion \"{id}\" must declare openclaw.build.openclawVersion")
+        })?;
+    if version != openclaw_version || build_version != openclaw_version {
+        return Err(format!(
+            "local companion \"{id}\" is not commit-matched: OpenClaw is {openclaw_version}, package version is {version}, and openclaw.build.openclawVersion is {build_version}"
+        ));
+    }
+    if package
+        .pointer("/openclaw/release/publishToNpm")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(format!(
+            "local companion \"{id}\" is not an official npm-publishable plugin"
+        ));
+    }
+    for relative in [
+        "scripts/lib/plugin-npm-runtime-build.mjs",
+        "scripts/generate-npm-package-lock.mjs",
+        "scripts/lib/plugin-npm-package-manifest.mjs",
+    ] {
+        if !repo_path.join(relative).is_file() {
+            return Err(format!(
+                "OpenClaw checkout does not provide the local companion packaging contract: missing {relative}"
+            ));
+        }
+    }
+    Ok(LocalCompanionSpec {
+        id,
+        directory_name: companion.directory_name.clone(),
+        package_name: package_name.to_string(),
+        version: version.to_string(),
+    })
+}
+
+fn run_local_companion_command(command: &mut Command, label: &str) -> Result<(), String> {
+    command
+        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
+        .env("npm_config_fund", "false")
+        .env("npm_config_audit", "false")
+        .env("npm_config_update_notifier", "false")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to run {label}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = summarize_command_output(&output.stdout, &output.stderr).unwrap_or_else(|| {
+        format!(
+            "command exited with code {}",
+            output.status.code().unwrap_or(1)
+        )
+    });
+    Err(format!("{label} failed: {detail}"))
+}
+
+fn pack_local_openclaw_companion(
+    repo_path: &Path,
+    pack_dir: &Path,
+    spec: LocalCompanionSpec,
+    env: &BTreeMap<String, String>,
+) -> Result<PackedLocalCompanion, String> {
+    let package_dir = format!("extensions/{}", spec.directory_name);
+    let output_dir = pack_dir.join("companions").join(&spec.id);
+    ensure_dir(&output_dir)?;
+
+    let mut build = Command::new("node");
+    build
+        .arg("scripts/lib/plugin-npm-runtime-build.mjs")
+        .arg(&package_dir)
+        .current_dir(repo_path);
+    run_local_companion_command(
+        &mut build,
+        &format!("local companion runtime build for {}", spec.id),
+    )?;
+
+    let mut lock_check = Command::new("node");
+    lock_check
+        .arg("scripts/generate-npm-package-lock.mjs")
+        .arg("--package-dir")
+        .arg(&package_dir)
+        .current_dir(repo_path);
+    run_local_companion_command(
+        &mut lock_check,
+        &format!("local companion package-lock check for {}", spec.id),
+    )?;
+
+    let mut pack = Command::new("node");
+    pack.arg("scripts/lib/plugin-npm-package-manifest.mjs")
+        .arg("--run")
+        .arg(&package_dir)
+        .arg("--")
+        .arg(npm_program(env))
+        .arg("pack")
+        .arg("--json")
+        .arg("--ignore-scripts")
+        .arg("--pack-destination")
+        .arg(&output_dir)
+        .current_dir(repo_path);
+    run_local_companion_command(
+        &mut pack,
+        &format!("local companion package build for {}", spec.id),
+    )?;
+
+    let mut archives = fs::read_dir(&output_dir)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("tgz"))
+        .collect::<Vec<_>>();
+    archives.sort();
+    let archive_path = match archives.len() {
+        1 => archives.remove(0),
+        0 => {
+            return Err(format!(
+                "local companion package build for {} did not produce an archive",
+                spec.id
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "local companion package build for {} produced multiple archives",
+                spec.id
+            ));
+        }
+    };
+    Ok(PackedLocalCompanion { spec, archive_path })
+}
+
+fn npm_package_path(package_name: &str) -> Result<PathBuf, String> {
+    let parts = package_name.split('/').collect::<Vec<_>>();
+    let valid_segment = |value: &str| {
+        !value.is_empty()
+            && value != "."
+            && value != ".."
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"@._-".contains(&byte)
+            })
+    };
+    if parts.len() == 1 && valid_segment(parts[0]) && !parts[0].starts_with('@') {
+        return Ok(PathBuf::from(parts[0]));
+    }
+    if parts.len() == 2
+        && parts[0].starts_with('@')
+        && valid_segment(parts[0])
+        && valid_segment(parts[1])
+    {
+        return Ok(PathBuf::from(parts[0]).join(parts[1]));
+    }
+    Err(format!(
+        "local companion package name \"{package_name}\" is not a safe npm package name"
+    ))
+}
+
+fn copy_companion_runtime_dependencies(
+    source_node_modules: &Path,
+    destination_node_modules: &Path,
+    own_package_path: &Path,
+) -> Result<(), String> {
+    ensure_dir(destination_node_modules)?;
+    let own_scope = (own_package_path.components().count() == 2)
+        .then(|| own_package_path.parent())
+        .flatten();
+    for entry in fs::read_dir(source_node_modules).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let source = entry.path();
+        let relative = PathBuf::from(entry.file_name());
+        if relative == Path::new(".package-lock.json") {
+            continue;
+        }
+        if own_scope == Some(relative.as_path()) {
+            let scope_destination = destination_node_modules.join(&relative);
+            ensure_dir(&scope_destination)?;
+            for scoped_entry in fs::read_dir(&source).map_err(|error| error.to_string())? {
+                let scoped_entry = scoped_entry.map_err(|error| error.to_string())?;
+                let scoped_relative = relative.join(scoped_entry.file_name());
+                if scoped_relative == own_package_path {
+                    continue;
+                }
+                copy_path(
+                    &scoped_entry.path(),
+                    &destination_node_modules.join(scoped_relative),
+                )?;
+            }
+            continue;
+        }
+        if relative == own_package_path {
+            continue;
+        }
+        copy_path(&source, &destination_node_modules.join(relative))?;
+    }
+    Ok(())
+}
+
+fn safe_companion_runtime_entrypoint(value: &str) -> Result<PathBuf, String> {
+    let normalized = value.trim().strip_prefix("./").unwrap_or(value.trim());
+    let path = PathBuf::from(normalized);
+    if normalized.is_empty()
+        || normalized.contains('\\')
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!(
+            "unsafe local companion runtime entrypoint \"{value}\""
+        ));
+    }
+    Ok(path)
+}
+
+fn install_local_openclaw_companion(
+    packed: &PackedLocalCompanion,
+    install_files: &Path,
+    scratch_dir: &Path,
+    context: InstallContext<'_>,
+    local_adapter: Option<&LocalBuildNpmAdapter>,
+) -> Result<RuntimeCompanionMeta, String> {
+    let install_root = scratch_dir.join("companion-installs").join(&packed.spec.id);
+    ensure_dir(&install_root)?;
+    let install_command = if let Some(local_adapter) = local_adapter {
+        CommandSpec {
+            program: local_adapter.real_npm.clone(),
+            args: Vec::new(),
+            path_prepend: None,
+        }
+    } else if verify_official_openclaw_runtime_host(context.env).is_ok() {
+        CommandSpec {
+            program: npm_program(context.env),
+            args: Vec::new(),
+            path_prepend: None,
+        }
+    } else {
+        managed_runtime_install_command(context.env, context.cwd)?
+    };
+    let mut command = Command::new(&install_command.program);
+    command
+        .args(&install_command.args)
+        .arg("install")
+        .arg("--prefix")
+        .arg(&install_root)
+        .arg("--omit=dev")
+        .arg("--omit=peer")
+        .arg("--no-save")
+        .arg("--package-lock=false")
+        .arg(&packed.archive_path)
+        .env("npm_config_fund", "false")
+        .env("npm_config_audit", "false")
+        .env("npm_config_update_notifier", "false")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    install_command.apply_environment(&mut command, context.env)?;
+    let output = command.output().map_err(|error| {
+        format!(
+            "failed to install local companion {} with {}: {error}",
+            packed.spec.id, install_command.program
+        )
+    })?;
+    if !output.status.success() {
+        let detail =
+            summarize_command_output(&output.stdout, &output.stderr).unwrap_or_else(|| {
+                format!(
+                    "{} exited with code {}",
+                    install_command.program,
+                    output.status.code().unwrap_or(1)
+                )
+            });
+        return Err(format!(
+            "failed to install local companion {}: {detail}",
+            packed.spec.id
+        ));
+    }
+
+    let package_path = npm_package_path(&packed.spec.package_name)?;
+    let source_package_root = install_root.join("node_modules").join(&package_path);
+    if !source_package_root.join("package.json").is_file() {
+        return Err(format!(
+            "local companion {} install is missing {}",
+            packed.spec.id,
+            display_path(&source_package_root.join("package.json"))
+        ));
+    }
+    let openclaw_package_root = installed_openclaw_package_root(install_files);
+    let target_package_root = openclaw_package_root
+        .join("dist/extensions")
+        .join(&packed.spec.id);
+    if path_exists(&target_package_root) {
+        return Err(format!(
+            "local companion {} collides with a plugin already bundled at {}",
+            packed.spec.id,
+            display_path(&target_package_root)
+        ));
+    }
+    copy_dir_recursive(&source_package_root, &target_package_root)?;
+    copy_companion_runtime_dependencies(
+        &install_root.join("node_modules"),
+        &target_package_root.join("node_modules"),
+        &package_path,
+    )?;
+    ensure_local_extension_openclaw_peer(&openclaw_package_root, &target_package_root)?;
+
+    let installed = load_json_value(
+        &target_package_root.join("package.json"),
+        "installed companion package.json",
+    )?;
+    let installed_name = installed
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let installed_version = installed
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let installed_build_version = installed
+        .pointer("/openclaw/build/openclawVersion")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if installed_name != packed.spec.package_name
+        || installed_version != packed.spec.version
+        || installed_build_version != packed.spec.version
+    {
+        return Err(format!(
+            "installed local companion {} failed parity verification",
+            packed.spec.id
+        ));
+    }
+    let entrypoint = installed
+        .pointer("/openclaw/runtimeExtensions/0")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "installed local companion {} does not declare openclaw.runtimeExtensions",
+                packed.spec.id
+            )
+        })?;
+    let entrypoint_relative = safe_companion_runtime_entrypoint(entrypoint)?;
+    let entrypoint_path = target_package_root.join(&entrypoint_relative);
+    if !entrypoint_path.is_file() {
+        return Err(format!(
+            "installed local companion {} is missing runtime entrypoint {}",
+            packed.spec.id,
+            display_path(&entrypoint_path)
+        ));
+    }
+    Ok(RuntimeCompanionMeta {
+        id: packed.spec.id.clone(),
+        package_name: packed.spec.package_name.clone(),
+        version: packed.spec.version.clone(),
+        artifact_sha256: file_sha256(&packed.archive_path)?,
+        entrypoint: display_path(
+            &PathBuf::from("dist/extensions")
+                .join(&packed.spec.id)
+                .join(entrypoint_relative),
+        ),
+        entrypoint_sha256: file_sha256(&entrypoint_path)?,
+    })
 }
 
 fn pack_local_openclaw_repo(
@@ -1309,6 +1814,70 @@ fn pack_local_source_extensions(
     Ok(archives)
 }
 
+fn remove_path_if_present(path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(path).map_err(|error| error.to_string())
+    } else {
+        fs::remove_file(path).map_err(|error| error.to_string())
+    }
+}
+
+fn link_or_copy_openclaw_host(source: &Path, target: &Path) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        ensure_dir(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        let link_target = relative_symlink_target(source, target).unwrap_or_else(|| source.into());
+        if std::os::unix::fs::symlink(link_target, target).is_ok() {
+            return Ok(());
+        }
+    }
+    #[cfg(windows)]
+    {
+        let link_target = relative_symlink_target(source, target).unwrap_or_else(|| source.into());
+        if std::os::windows::fs::symlink_dir(link_target, target).is_ok() {
+            return Ok(());
+        }
+    }
+
+    // The target is nested inside the host package, so stage the fallback outside
+    // that tree before copying to avoid recursively copying the destination.
+    let staged = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let staged_host = staged.path().join("openclaw");
+    copy_dir_recursive(source, &staged_host)?;
+    copy_dir_recursive(&staged_host, target)
+}
+
+fn ensure_local_extension_openclaw_peer(
+    host_package: &Path,
+    extension_root: &Path,
+) -> Result<(), String> {
+    let package_json_path = extension_root.join("package.json");
+    let package: serde_json::Value = read_json(&package_json_path).map_err(|error| {
+        format!(
+            "failed to inspect installed source extension package at {}: {error}",
+            display_path(&package_json_path)
+        )
+    })?;
+    if package
+        .pointer("/peerDependencies/openclaw")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        return Ok(());
+    }
+
+    let peer_path = extension_root.join("node_modules/openclaw");
+    remove_path_if_present(&peer_path)?;
+    link_or_copy_openclaw_host(host_package, &peer_path)
+}
+
 fn materialize_local_source_extensions(
     install_files: &Path,
     extensions: &[LocalSourceExtensionArchive],
@@ -1343,6 +1912,10 @@ fn materialize_local_source_extensions(
             ));
         }
         copy_dir_recursive(&installed_package, &target)?;
+        ensure_local_extension_openclaw_peer(
+            &installed_openclaw_package_root(install_files),
+            &target,
+        )?;
     }
     Ok(())
 }
@@ -1376,6 +1949,7 @@ fn build_installed_runtime_meta(
         release_selector_kind: release.selector_kind.clone(),
         release_selector_value: release.selector_value.clone(),
         install_root: Some(display_path(&target.final_install_root)),
+        companions: Vec::new(),
         description,
         created_at,
         updated_at: created_at,
@@ -1577,6 +2151,7 @@ fn prepare_runtime_from_openclaw_package(
     })()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_runtime_from_openclaw_package_archive(
     target: &RuntimeInstallTarget,
     archive_path: &Path,
@@ -1795,6 +2370,7 @@ pub fn add_runtime(
         release_selector_kind: None,
         release_selector_value: None,
         install_root: None,
+        companions: Vec::new(),
         description,
         created_at,
         updated_at: created_at,
@@ -1923,6 +2499,16 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
     let repo_path = fs::canonicalize(&repo_path).map_err(|error| error.to_string())?;
     ensure_checkout_owned_dependencies(&repo_path)?;
     let version = load_openclaw_repo_version(&repo_path)?;
+    let mut companion_specs = BTreeMap::new();
+    for companion in &options.companions {
+        let spec = load_local_companion_spec(&repo_path, companion, &version)?;
+        if companion_specs.insert(spec.id.clone(), spec).is_some() {
+            return Err(format!(
+                "local companion plugin \"{}\" was selected more than once",
+                companion.trim()
+            ));
+        }
+    }
     let commit = git_short_commit(&repo_path);
     let target_source_plugins = options
         .target_env
@@ -1982,6 +2568,10 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
         } else {
             Vec::new()
         };
+        let packed_companions = companion_specs
+            .into_values()
+            .map(|spec| pack_local_openclaw_companion(&repo_path, &pack_dir, spec, context.env))
+            .collect::<Result<Vec<_>, _>>()?;
         let target = prepare_runtime_install_target(name, options.force, context.env, context.cwd)?;
         if path_exists(&target.install_root) {
             return Err(format!(
@@ -1992,7 +2582,7 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
         ensure_dir(&target.install_files)?;
         let description = trim_description(options.description)
             .or_else(|| Some(default_local_build_description(&version, commit.as_deref())));
-        let meta = stage_runtime_from_openclaw_package_archive(
+        let mut meta = stage_runtime_from_openclaw_package_archive(
             &target,
             &archive_path,
             RuntimeSourceDetails {
@@ -2008,6 +2598,19 @@ pub(crate) fn install_runtime_from_local_openclaw_build(
             local_adapter.as_ref(),
             &source_extensions,
         )?;
+        meta.companions = packed_companions
+            .iter()
+            .map(|packed| {
+                install_local_openclaw_companion(
+                    packed,
+                    &target.install_files,
+                    &pack_dir,
+                    context,
+                    local_adapter.as_ref(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        meta.runtime_sha256 = Some(tree_sha256(&target.install_files.join("node_modules"))?);
         publish_runtime(target, meta)
     })();
 
@@ -2051,6 +2654,7 @@ pub fn install_runtime_from_release(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn install_runtime_from_selected_release(
     name: String,
     force: bool,
@@ -2293,11 +2897,92 @@ fn runtime_execution_issue(meta: &RuntimeMeta, env: &BTreeMap<String, String>) -
     None
 }
 
+fn runtime_companion_integrity_issue(meta: &RuntimeMeta) -> Option<String> {
+    let package_root = openclaw_package_root_from_binary(Path::new(&meta.binary_path))?;
+    for companion in &meta.companions {
+        if validate_local_companion_id(&companion.id).is_err() {
+            return Some(format!(
+                "runtime companion has invalid plugin id: {}",
+                companion.id
+            ));
+        }
+        if normalize_sha256(&companion.artifact_sha256).is_err() {
+            return Some(format!(
+                "runtime companion {} has invalid artifact sha256",
+                companion.id
+            ));
+        }
+        let entrypoint_prefix = format!("dist/extensions/{}/", companion.id);
+        let Some(entrypoint_relative) = companion.entrypoint.strip_prefix(&entrypoint_prefix)
+        else {
+            return Some(format!(
+                "runtime companion {} has invalid entrypoint path: {}",
+                companion.id, companion.entrypoint
+            ));
+        };
+        let entrypoint_relative = match safe_companion_runtime_entrypoint(entrypoint_relative) {
+            Ok(path) => path,
+            Err(error) => return Some(error),
+        };
+        let expected_entrypoint = PathBuf::from("dist/extensions")
+            .join(&companion.id)
+            .join(entrypoint_relative);
+        if display_path(&expected_entrypoint) != companion.entrypoint {
+            return Some(format!(
+                "runtime companion {} has invalid entrypoint path: {}",
+                companion.id, companion.entrypoint
+            ));
+        }
+        let companion_root = package_root.join("dist/extensions").join(&companion.id);
+        let package_json_path = companion_root.join("package.json");
+        let package = match load_json_value(&package_json_path, "runtime companion package.json") {
+            Ok(value) => value,
+            Err(error) => return Some(error),
+        };
+        if package.get("name").and_then(serde_json::Value::as_str)
+            != Some(companion.package_name.as_str())
+            || package.get("version").and_then(serde_json::Value::as_str)
+                != Some(companion.version.as_str())
+        {
+            return Some(format!(
+                "runtime companion {} package metadata does not match its runtime record",
+                companion.id
+            ));
+        }
+        let entrypoint_path = package_root.join(&companion.entrypoint);
+        if !entrypoint_path.is_file() {
+            return Some(format!(
+                "runtime companion {} entrypoint does not exist: {}",
+                companion.id,
+                display_path(&entrypoint_path)
+            ));
+        }
+        let expected_entrypoint_sha256 = match normalize_sha256(&companion.entrypoint_sha256) {
+            Ok(value) => value,
+            Err(error) => return Some(error),
+        };
+        let actual_entrypoint_sha256 = match file_sha256(&entrypoint_path) {
+            Ok(value) => value,
+            Err(error) => return Some(error),
+        };
+        if actual_entrypoint_sha256 != expected_entrypoint_sha256 {
+            return Some(format!(
+                "runtime companion {} entrypoint sha256 mismatch: expected {}, got {}",
+                companion.id, expected_entrypoint_sha256, actual_entrypoint_sha256
+            ));
+        }
+    }
+    None
+}
+
 pub fn runtime_integrity_issue(
     meta: &RuntimeMeta,
     env: &BTreeMap<String, String>,
 ) -> Option<String> {
     if let Some(issue) = runtime_execution_issue(meta, env) {
+        return Some(issue);
+    }
+    if let Some(issue) = runtime_companion_integrity_issue(meta) {
         return Some(issue);
     }
 
