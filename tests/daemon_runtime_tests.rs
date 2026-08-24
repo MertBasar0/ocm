@@ -13,8 +13,8 @@ use ocm::supervisor::{SupervisorService, sync_supervisor_binding_if_present};
 use serde_json::{Value, to_value};
 
 use crate::support::{
-    TestDir, install_fake_systemd_tools, ocm_env, path_string, run_ocm, stderr, stdout,
-    write_executable_script,
+    TestDir, install_fake_launchctl, install_fake_systemd_tools, ocm_env, path_string, run_ocm,
+    stderr, stdout, write_executable_script,
 };
 
 static DAEMON_RUNTIME_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -621,6 +621,180 @@ fn env_changes_refresh_persisted_service_state_without_extra_commands() {
 }
 
 #[test]
+fn start_create_preserves_running_siblings_despite_caller_environment_drift() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("start-create-preserves-supervisor-siblings");
+    let (cwd, mut env, _, _) = setup_daemon_run_fixture_with_child_sleep(&root, 3600);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+
+    // Start two supervised siblings and capture the exact persisted and runtime identities.
+    service.sync().unwrap();
+    let initial_state = read_persisted_service_state(&state_path);
+    let initial_children = initial_state["children"].clone();
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
+        .expect("daemon runtime state did not report both children");
+    let demo_pid = runtime_child_pid(&initial_runtime, "demo").unwrap();
+    let prod_pid = runtime_child_pid(&initial_runtime, "prod").unwrap();
+
+    env.insert(
+        "NODE_OPTIONS".to_string(),
+        "--max-old-space-size=2048".to_string(),
+    );
+    // Reproduce the incident-shaped no-service creation under caller-environment drift.
+    let started = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "start",
+            "pr121799-macos-proof",
+            "--command",
+            "node openclaw.mjs",
+            "--cwd",
+            &path_string(&cwd),
+            "--port",
+            "19079",
+            "--no-service",
+            "--json",
+        ],
+    );
+    assert!(started.status.success(), "{}", stderr(&started));
+    sleep(Duration::from_millis(800));
+
+    let final_state = read_persisted_service_state(&state_path);
+    let final_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(2))
+        .expect("daemon runtime state stopped reporting both children");
+
+    // The new disabled env may be recorded, but neither running sibling may change.
+    assert_eq!(
+        final_state["children"], initial_children,
+        "creating a no-service env changed unrelated child specs"
+    );
+    assert_eq!(
+        runtime_child_pid(&final_runtime, "demo"),
+        Some(demo_pid),
+        "creating a no-service env restarted the demo child"
+    );
+    assert_eq!(
+        runtime_child_pid(&final_runtime, "prod"),
+        Some(prod_pid),
+        "creating a no-service env restarted the prod child"
+    );
+    assert!(
+        final_state["skippedEnvs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["envName"] == "pr121799-macos-proof")
+    );
+
+    stop_process(&mut daemon);
+}
+
+#[test]
+fn env_clone_preserves_unrelated_supervisor_child_specs() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("env-clone-preserves-supervisor-siblings");
+    let (cwd, mut env) = setup_service_fixture(&root);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+
+    service.sync().unwrap();
+    env.insert(
+        "NODE_OPTIONS".to_string(),
+        "--max-old-space-size=2048".to_string(),
+    );
+
+    let cloned = run_ocm(&cwd, &env, &["env", "clone", "demo", "demo-clone"]);
+    assert!(cloned.status.success(), "{}", stderr(&cloned));
+
+    let state = read_persisted_service_state(&state_path);
+    let demo = state["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["envName"] == "demo")
+        .expect("demo child spec should remain present");
+    assert!(
+        demo["processEnv"]["NODE_OPTIONS"].is_null(),
+        "clone must not rebuild unrelated child specs from caller environment"
+    );
+    assert!(
+        state["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|child| child["envName"] != "demo-clone")
+    );
+    assert!(
+        state["skippedEnvs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["envName"] == "demo-clone")
+    );
+}
+
+#[test]
+fn env_import_preserves_unrelated_supervisor_child_specs() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("env-import-preserves-supervisor-siblings");
+    let (cwd, mut env) = setup_service_fixture(&root);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+
+    service.sync().unwrap();
+    let exported = run_ocm(&cwd, &env, &["env", "export", "demo"]);
+    assert!(exported.status.success(), "{}", stderr(&exported));
+
+    env.insert(
+        "NODE_OPTIONS".to_string(),
+        "--max-old-space-size=2048".to_string(),
+    );
+    let imported = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "env",
+            "import",
+            "./demo.ocm-env.tar",
+            "--name",
+            "demo-import",
+        ],
+    );
+    assert!(imported.status.success(), "{}", stderr(&imported));
+
+    let state = read_persisted_service_state(&state_path);
+    let demo = state["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["envName"] == "demo")
+        .expect("demo child spec should remain present");
+    assert!(
+        demo["processEnv"]["NODE_OPTIONS"].is_null(),
+        "import must not rebuild unrelated child specs from caller environment"
+    );
+    assert!(
+        state["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|child| child["envName"] != "demo-import")
+    );
+    assert!(
+        state["skippedEnvs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["envName"] == "demo-import")
+    );
+}
+
+#[test]
 fn child_restart_request_rebuilds_missing_or_stale_state() {
     let _guard = daemon_runtime_test_lock();
     let root = TestDir::new("restart-request-rebuilds-state");
@@ -840,7 +1014,7 @@ fn publishing_an_unbound_runtime_preserves_unrelated_active_child_spec_and_pid()
     write_legacy_openclaw_script(
         &runtime_a,
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 3600; done\n",
             path_string(&started),
             path_string(&stopped),
         ),
@@ -940,7 +1114,7 @@ fn targeted_runtime_refresh_ignores_unrelated_drift_and_restarts_effective_chang
     write_legacy_openclaw_script(
         &runtime_a,
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >> '{}'\ntrap 'printf \"%s\\n\" \"$$\" >> \"{}\"; exit 0' TERM INT\nwhile :; do sleep 3600; done\n",
             path_string(&runtime_a_started),
             path_string(&runtime_a_stopped),
         ),
@@ -1176,6 +1350,164 @@ fn service_uninstall_removes_only_target_child_despite_unrelated_drift() {
     );
 
     stop_process(&mut daemon);
+}
+
+#[test]
+fn service_start_preserves_running_siblings_despite_unrelated_drift() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-targeted-service-start");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let runtime_path = root.child("ocm-home/supervisor/runtime.json");
+    let state_path = root.child("ocm-home/supervisor/state.json");
+
+    for (runtime_name, env_name) in [("target-runtime", "target"), ("sibling-runtime", "sibling")] {
+        let runtime = root.child(format!("bin/{runtime_name}"));
+        write_legacy_openclaw_script(
+            &runtime,
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+        );
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                runtime_name,
+                "--path",
+                &path_string(&runtime),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", env_name, "--runtime", runtime_name],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        set_service_enabled(&cwd, &env, env_name, true);
+    }
+    service.sync().unwrap();
+    service.install_daemon().unwrap();
+    let daemon_status = service.daemon_status().unwrap();
+    assert!(
+        daemon_status.running,
+        "fixture must report the managed daemon as running: {daemon_status:?}"
+    );
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
+        .expect("daemon runtime state did not report both children");
+    let target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
+    let sibling_pid = runtime_child_pid(&initial_runtime, "sibling").unwrap();
+
+    let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
+    let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
+    sibling_meta["releaseVersion"] = Value::String("latent-sibling-v2".to_string());
+    write_persisted_service_state(&sibling_meta_path, &sibling_meta);
+
+    let start = run_ocm(&cwd, &env, &["service", "start", "target", "--json"]);
+    assert!(start.status.success(), "{}", stderr(&start));
+    sleep(Duration::from_millis(800));
+
+    let final_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(2))
+        .expect("daemon runtime state stopped reporting both children");
+    let final_state = read_persisted_service_state(&state_path);
+    let persisted_sibling = final_state["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["envName"] == "sibling")
+        .unwrap();
+
+    assert_eq!(
+        runtime_child_pid(&final_runtime, "target"),
+        Some(target_pid),
+        "already-running target child PID changed"
+    );
+    assert_eq!(
+        runtime_child_pid(&final_runtime, "sibling"),
+        Some(sibling_pid),
+        "sibling child PID changed"
+    );
+    assert!(
+        persisted_sibling["runtimeReleaseVersion"].is_null(),
+        "target start applied unrelated sibling drift"
+    );
+
+    stop_process(&mut daemon);
+}
+
+#[test]
+fn service_start_reconciles_siblings_before_activating_stopped_daemon() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("daemon-stopped-targeted-service-start");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert(
+        "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
+        "launchd".to_string(),
+    );
+    install_fake_launchctl(&root, &mut env);
+    let service = SupervisorService::new(&env, &cwd);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+
+    for (runtime_name, env_name) in [("target-runtime", "target"), ("sibling-runtime", "sibling")] {
+        let runtime = root.child(format!("bin/{runtime_name}"));
+        write_legacy_openclaw_script(
+            &runtime,
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+        );
+        let add = run_ocm(
+            &cwd,
+            &env,
+            &[
+                "runtime",
+                "add",
+                runtime_name,
+                "--path",
+                &path_string(&runtime),
+            ],
+        );
+        assert!(add.status.success(), "{}", stderr(&add));
+        let create = run_ocm(
+            &cwd,
+            &env,
+            &["env", "create", env_name, "--runtime", runtime_name],
+        );
+        assert!(create.status.success(), "{}", stderr(&create));
+        set_service_enabled(&cwd, &env, env_name, true);
+    }
+    service.sync().unwrap();
+
+    let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
+    let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
+    sibling_meta["releaseVersion"] = Value::String("latent-sibling-v2".to_string());
+    write_persisted_service_state(&sibling_meta_path, &sibling_meta);
+
+    let start = run_ocm(&cwd, &env, &["service", "start", "target", "--json"]);
+    assert!(start.status.success(), "{}", stderr(&start));
+
+    let final_state = read_persisted_service_state(&state_path);
+    let persisted_sibling = final_state["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["envName"] == "sibling")
+        .expect("sibling child spec should remain present");
+
+    assert_eq!(
+        persisted_sibling["runtimeReleaseVersion"], "latent-sibling-v2",
+        "stopped-daemon activation must reconcile stale sibling state"
+    );
 }
 
 #[test]

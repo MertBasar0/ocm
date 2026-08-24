@@ -228,13 +228,13 @@ impl<'a> EnvironmentService<'a> {
 
     pub fn create(&self, options: CreateEnvironmentOptions) -> Result<EnvMeta, String> {
         let meta = create_environment_with_validated_runtime(options, self.env, self.cwd)?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
         Ok(meta)
     }
 
     pub fn clone(&self, options: CloneEnvironmentOptions) -> Result<EnvMeta, String> {
         let meta = clone_environment(options, self.env, self.cwd)?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
         Ok(meta)
     }
 
@@ -243,7 +243,7 @@ impl<'a> EnvironmentService<'a> {
         options: CloneEnvironmentOptions,
     ) -> Result<EnvMeta, String> {
         let meta = clone_environment_for_simulation(options, self.env, self.cwd)?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &meta.name)?;
         Ok(meta)
     }
 
@@ -258,7 +258,7 @@ impl<'a> EnvironmentService<'a> {
             self.env,
             self.cwd,
         )?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &result.meta.name)?;
         Ok(result)
     }
 
@@ -268,7 +268,7 @@ impl<'a> EnvironmentService<'a> {
 
     pub fn import(&self, options: ImportEnvironmentOptions) -> Result<EnvImportSummary, String> {
         let summary = import_environment(options, self.env, self.cwd)?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &summary.name)?;
         Ok(summary)
     }
 
@@ -283,7 +283,7 @@ impl<'a> EnvironmentService<'a> {
             self.env,
             self.cwd,
         )?;
-        sync_supervisor_if_present(self.env, self.cwd)?;
+        sync_supervisor_env_if_present(self.env, self.cwd, &result.summary.name)?;
         Ok(result)
     }
 
