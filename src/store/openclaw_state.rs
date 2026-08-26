@@ -405,7 +405,10 @@ fn relocate_installed_plugin_index_paths(
     if !external_plugin_ids.is_empty() {
         return Err(format!(
             "imported OpenClaw plugin path(s) could not be isolated inside the env state: {}",
-            external_plugin_ids.into_iter().collect::<Vec<_>>().join(", ")
+            external_plugin_ids
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     if !changed {
