@@ -1240,7 +1240,7 @@ fn adopt_import_rejects_a_symlinked_plugin_database_without_mutating_its_target(
 }
 
 #[test]
-fn adopt_import_preserves_external_plugin_checkouts_with_an_isolation_warning() {
+fn adopt_import_rejects_external_plugin_paths_without_mutating_the_source() {
     let root = TestDir::new("adopt-import-external-plugin");
     let cwd = root.child("workspace");
     let source_home = root.child("legacy-home/.openclaw");
@@ -1260,6 +1260,8 @@ fn adopt_import_preserves_external_plugin_checkouts_with_an_isolation_warning() 
             }
         }),
     );
+    let source_database = source_home.join("state/openclaw.sqlite");
+    let source_database_before = fs::read(&source_database).unwrap();
 
     let env = ocm_env(&root);
     let output = run_ocm(
@@ -1274,28 +1276,20 @@ fn adopt_import_preserves_external_plugin_checkouts_with_an_isolation_warning() 
             "--json",
         ],
     );
-    assert!(output.status.success(), "{}", stderr(&output));
+
+    assert_eq!(output.status.code(), Some(1));
     assert!(
         stderr(&output).contains(
-            "warning: imported plugin external-dev could not be isolated inside the env state; OCM preserved but did not copy or modify its external location"
+            "imported OpenClaw plugin path(s) could not be isolated inside the env state: external-dev"
         ),
         "{}",
         stderr(&output)
     );
-
-    let imported_records = read_imported_plugin_install_records(&root, "mira");
-    assert_eq!(
-        imported_records["external-dev"]["installPath"].as_str(),
-        Some(external_plugin.to_string_lossy().as_ref())
-    );
+    assert!(!root.child("ocm-home/envs/mira").exists());
+    assert_eq!(fs::read(&source_database).unwrap(), source_database_before);
     assert_eq!(
         fs::read_to_string(external_plugin.join("marker.txt")).unwrap(),
         "external checkout\n"
-    );
-    assert!(
-        !root
-            .child("ocm-home/envs/mira/.openclaw/external-checkout")
-            .exists()
     );
 }
 
