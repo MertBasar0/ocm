@@ -51,6 +51,18 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ocm-98-credential-free-reproduction
-          path: ${{ runner.temp }}/ocm98-evidence
+          path: |
+            ${{ runner.temp }}/ocm98-evidence/*.txt
+            ${{ runner.temp }}/ocm98-evidence/*.json
+            ${{ runner.temp }}/ocm98-evidence/*.log
+            ${{ runner.temp }}/ocm98-evidence/v0.2.32/*.txt
+            ${{ runner.temp }}/ocm98-evidence/v0.2.32/*.json
+            ${{ runner.temp }}/ocm98-evidence/v0.2.32/*.sha256
+            ${{ runner.temp }}/ocm98-evidence/current-main/*.txt
+            ${{ runner.temp }}/ocm98-evidence/current-main/*.json
+            ${{ runner.temp }}/ocm98-evidence/current-main/*.sha256
+            ${{ runner.temp }}/ocm98-evidence/explicit-path-control/*.txt
+            ${{ runner.temp }}/ocm98-evidence/explicit-path-control/*.json
+            ${{ runner.temp }}/ocm98-evidence/explicit-path-control/*.sha256
           if-no-files-found: error
           retention-days: 14
