@@ -8,12 +8,14 @@ fixture_root="$evidence_root/fixture"
 seed_home="$fixture_root/seed-home"
 seed_state="$seed_home/.openclaw"
 seed_checkout="$fixture_root/source-checkout"
+seed_acpx="$seed_state/npm/projects/fixture/node_modules/@openclaw/acpx"
 npm_cache="$fixture_root/npm-cache"
 db_meta_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/ocm-98-db-meta.mjs"
 
 mkdir -p "$evidence_root" "$seed_state/state" "$seed_state/workspace" "$npm_cache"
 mkdir -p "$seed_checkout/dist/extensions/codex"
 mkdir -p "$seed_checkout/extensions/whatsapp-target"
+mkdir -p "$seed_acpx"
 
 resolved_evidence_root=$(realpath -m "$evidence_root")
 resolved_fixture_root=$(realpath -m "$fixture_root")
@@ -33,9 +35,12 @@ printf '{"id":"codex","name":"Credential-free fixture"}\n' \
   > "$seed_checkout/dist/extensions/codex/openclaw.plugin.json"
 printf '{"id":"whatsapp","name":"Credential-free fixture"}\n' \
   > "$seed_checkout/extensions/whatsapp-target/openclaw.plugin.json"
+printf '{"id":"acpx","name":"Credential-free fixture"}\n' \
+  > "$seed_acpx/openclaw.plugin.json"
 ln -s whatsapp-target "$seed_checkout/extensions/whatsapp-link"
 
-cat > "$seed_state/openclaw.json" <<EOF
+write_fixture_config() {
+  cat > "$seed_state/openclaw.json" <<EOF
 {
   "agents": {
     "defaults": { "workspace": "$seed_state/workspace" },
@@ -46,20 +51,64 @@ cat > "$seed_state/openclaw.json" <<EOF
     "entries": {
       "codex": { "enabled": true },
       "whatsapp": { "enabled": true }
-    }
-  },
-  "installRecords": {
-    "codex": {
-      "source": "path",
-      "sourcePath": "$seed_checkout/dist/extensions/codex",
-      "installPath": "$seed_checkout/dist/extensions/codex",
-      "version": "2026.8.1"
     },
-    "whatsapp": {
-      "source": "path",
-      "sourcePath": "$seed_checkout/extensions/whatsapp-link",
-      "installPath": "$seed_checkout/extensions/whatsapp-link",
-      "version": "2026.8.1"
+    "installs": {
+      "acpx": {
+        "source": "npm",
+        "installPath": "$seed_acpx"
+      },
+      "codex": {
+        "source": "path",
+        "sourcePath": "$seed_checkout/dist/extensions/codex",
+        "installPath": "$seed_checkout/dist/extensions/codex"
+      },
+      "whatsapp": {
+        "source": "path",
+        "sourcePath": "$seed_checkout/extensions/whatsapp-link",
+        "installPath": "$seed_checkout/extensions/whatsapp-link"
+      }
+    }
+  }
+}
+EOF
+}
+
+write_fixture_config
+
+cat > "$evidence_root/fixture-config.redacted.json" <<'EOF'
+{
+  "agents": {
+    "defaults": { "workspace": "<FIXTURE_ROOT>/seed-home/.openclaw/workspace" },
+    "list": [
+      {
+        "id": "main",
+        "workspace": "<FIXTURE_ROOT>/seed-home/.openclaw/workspace"
+      }
+    ]
+  },
+  "plugins": {
+    "load": {
+      "paths": ["<FIXTURE_ROOT>/source-checkout/extensions/whatsapp-link"]
+    },
+    "entries": {
+      "codex": { "enabled": true },
+      "whatsapp": { "enabled": true }
+    },
+    "installs": {
+      "acpx": {
+        "source": "npm",
+        "installPath": "<FIXTURE_ROOT>/seed-home/.openclaw/npm/projects/fixture/node_modules/@openclaw/acpx"
+      },
+      "codex": {
+        "source": "path",
+        "sourcePath": "<FIXTURE_ROOT>/source-checkout/dist/extensions/codex",
+        "installPath": "<FIXTURE_ROOT>/source-checkout/dist/extensions/codex"
+      },
+      "whatsapp": {
+        "source": "path",
+        "sourcePath": "<FIXTURE_ROOT>/source-checkout/extensions/whatsapp-link",
+        "installPath": "<FIXTURE_ROOT>/source-checkout/extensions/whatsapp-link"
+      }
     }
   }
 }
@@ -78,12 +127,17 @@ printf '%s\n' \
 {
   printf 'fixtureRoot=<FIXTURE_ROOT>\n'
   printf 'sourceState=<FIXTURE_ROOT>/seed-home/.openclaw\n'
-  printf 'workspace=<FIXTURE_ROOT>/seed-home/.openclaw/workspace\n'
+  printf 'agents.defaults.workspace=<FIXTURE_ROOT>/seed-home/.openclaw/workspace\n'
+  printf 'agents.list[main].workspace=<FIXTURE_ROOT>/seed-home/.openclaw/workspace\n'
   printf 'plugins.load.paths[0]=<FIXTURE_ROOT>/source-checkout/extensions/whatsapp-link\n'
-  printf 'codex.sourcePath=<FIXTURE_ROOT>/source-checkout/dist/extensions/codex\n'
-  printf 'codex.installPath=<FIXTURE_ROOT>/source-checkout/dist/extensions/codex\n'
-  printf 'whatsapp.sourcePath=<FIXTURE_ROOT>/source-checkout/extensions/whatsapp-link\n'
-  printf 'whatsapp.installPath=<FIXTURE_ROOT>/source-checkout/extensions/whatsapp-link\n'
+  printf 'plugins.installs.acpx.source=npm\n'
+  printf 'plugins.installs.acpx.installPath=<FIXTURE_ROOT>/seed-home/.openclaw/npm/projects/fixture/node_modules/@openclaw/acpx\n'
+  printf 'plugins.installs.codex.source=path\n'
+  printf 'plugins.installs.codex.sourcePath=<FIXTURE_ROOT>/source-checkout/dist/extensions/codex\n'
+  printf 'plugins.installs.codex.installPath=<FIXTURE_ROOT>/source-checkout/dist/extensions/codex\n'
+  printf 'plugins.installs.whatsapp.source=path\n'
+  printf 'plugins.installs.whatsapp.sourcePath=<FIXTURE_ROOT>/source-checkout/extensions/whatsapp-link\n'
+  printf 'plugins.installs.whatsapp.installPath=<FIXTURE_ROOT>/source-checkout/extensions/whatsapp-link\n'
   printf 'whatsapp.symlinkTarget=%s\n' "$(readlink "$seed_checkout/extensions/whatsapp-link")"
 } > "$evidence_root/path-manifest.txt"
 
@@ -136,6 +190,7 @@ if [ "$seed_version" != "6" ]; then
 fi
 node "$db_meta_script" "$seed_database" retireCommitmentsV7 \
   > "$evidence_root/seed-schema7-migration.txt"
+write_fixture_config
 node "$db_meta_script" "$seed_database" > "$evidence_root/seed-before.json"
 seed_version=$(node "$db_meta_script" "$seed_database" userVersion)
 if [ "$seed_version" != "7" ]; then
@@ -151,6 +206,7 @@ run_lane() {
   lane_home="$lane_root/home"
   lane_state="$lane_home/.openclaw"
   lane_database="$lane_state/state/openclaw.sqlite"
+  lane_config="$lane_state/openclaw.json"
   lane_ocm_home="$lane_root/ocm"
   lane_tmp="$lane_root/tmp"
   mkdir -p "$lane_home" "$lane_ocm_home" "$lane_tmp"
@@ -158,17 +214,18 @@ run_lane() {
 
   node "$db_meta_script" "$lane_database" > "$lane_root/before.json"
   sha256sum "$lane_database" > "$lane_root/before.sha256"
+  sha256sum "$lane_config" > "$lane_root/before-config.sha256"
   before_hash=$(cut -d ' ' -f 1 "$lane_root/before.sha256")
+  before_config_hash=$(cut -d ' ' -f 1 "$lane_root/before-config.sha256")
   before_version=$(node "$db_meta_script" "$lane_database" userVersion)
   if [ "$before_version" != "7" ]; then
     echo "$lane_name did not start at schema 7" >&2
     exit 1
   fi
 
-  printf 'env -i HOME=<FIXTURE_ROOT>/%s/home OCM_HOME=<FIXTURE_ROOT>/%s/ocm PATH=<NODE_AND_OCM_PATH> ocm runtime install --version 2026.8.1-beta.2 --json\n' \
-    "$lane_name" "$lane_name" > "$lane_root/command.txt"
-
   if [ "$expected_change" = "source" ]; then
+    printf 'env -i HOME=<FIXTURE_ROOT>/%s/home OCM_HOME=<FIXTURE_ROOT>/%s/ocm PATH=<NODE_AND_OCM_PATH> ocm runtime install --version 2026.8.1-beta.2 --json\n' \
+      "$lane_name" "$lane_name" > "$lane_root/command.txt"
     env -i \
       HOME="$lane_home" \
       OCM_HOME="$lane_ocm_home" \
@@ -179,6 +236,9 @@ run_lane() {
   else
     postinstall_state="$lane_root/postinstall-state"
     mkdir -p "$postinstall_state"
+    printf 'env -i HOME=<FIXTURE_ROOT>/%s/home OCM_HOME=<FIXTURE_ROOT>/%s/ocm PATH=<NODE_AND_OCM_PATH> OPENCLAW_HOME=<FIXTURE_ROOT>/%s/postinstall-state OPENCLAW_STATE_DIR=<FIXTURE_ROOT>/%s/postinstall-state OPENCLAW_CONFIG_PATH=<FIXTURE_ROOT>/%s/postinstall-state/openclaw.json ocm runtime install --version 2026.8.1-beta.2 --json\n' \
+      "$lane_name" "$lane_name" "$lane_name" "$lane_name" "$lane_name" \
+      > "$lane_root/command.txt"
     env -i \
       HOME="$lane_home" \
       OCM_HOME="$lane_ocm_home" \
@@ -193,7 +253,9 @@ run_lane() {
 
   node "$db_meta_script" "$lane_database" > "$lane_root/after.json"
   sha256sum "$lane_database" > "$lane_root/after.sha256"
+  sha256sum "$lane_config" > "$lane_root/after-config.sha256"
   after_hash=$(cut -d ' ' -f 1 "$lane_root/after.sha256")
+  after_config_hash=$(cut -d ' ' -f 1 "$lane_root/after-config.sha256")
   after_version=$(node "$db_meta_script" "$lane_database" userVersion)
 
   if [ "$expected_change" = "source" ]; then
@@ -203,19 +265,21 @@ run_lane() {
     fi
     result="reproduced-source-mutation"
   else
-    if [ "$after_version" != "7" ] || [ "$before_hash" != "$after_hash" ]; then
+    if [ "$after_version" != "7" ] || [ "$before_hash" != "$after_hash" ] || \
+      [ "$before_config_hash" != "$after_config_hash" ]; then
       echo "$lane_name control source changed unexpectedly" >&2
       exit 1
     fi
     result="source-unchanged"
   fi
 
-  printf '{\n  "lane": "%s",\n  "result": "%s",\n  "beforeVersion": %s,\n  "afterVersion": %s,\n  "sourceHashChanged": %s\n}\n' \
+  printf '{\n  "lane": "%s",\n  "result": "%s",\n  "beforeVersion": %s,\n  "afterVersion": %s,\n  "sourceHashChanged": %s,\n  "sourceConfigHashChanged": %s\n}\n' \
     "$lane_name" \
     "$result" \
     "$before_version" \
     "$after_version" \
     "$([ "$before_hash" = "$after_hash" ] && printf false || printf true)" \
+    "$([ "$before_config_hash" = "$after_config_hash" ] && printf false || printf true)" \
     > "$lane_root/result.json"
 }
 
