@@ -128,10 +128,18 @@ if [ ! -f "$seed_database" ]; then
   echo "stable package did not create the credential-free state database" >&2
   exit 1
 fi
+node "$db_meta_script" "$seed_database" > "$evidence_root/seed-schema6.json"
+seed_version=$(node "$db_meta_script" "$seed_database" userVersion)
+if [ "$seed_version" != "6" ]; then
+  echo "expected the beta.1 fixture to use schema 6; got $seed_version" >&2
+  exit 1
+fi
+node "$db_meta_script" "$seed_database" retireCommitmentsV7 \
+  > "$evidence_root/seed-schema7-migration.txt"
 node "$db_meta_script" "$seed_database" > "$evidence_root/seed-before.json"
 seed_version=$(node "$db_meta_script" "$seed_database" userVersion)
 if [ "$seed_version" != "7" ]; then
-  echo "expected the stable fixture to use schema 7; got $seed_version" >&2
+  echo "canonical commitments retirement did not produce schema 7; got $seed_version" >&2
   exit 1
 fi
 
