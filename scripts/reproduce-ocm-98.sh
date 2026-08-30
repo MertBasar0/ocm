@@ -94,8 +94,8 @@ env -i \
   OPENCLAW_STATE_DIR="$seed_state" \
   OPENCLAW_CONFIG_PATH="$seed_state/openclaw.json" \
   npm_config_cache="$npm_cache" \
-  npm view openclaw@2026.8.1 version dist.tarball dist.integrity --json \
-  > "$evidence_root/openclaw-2026.8.1-package.json"
+  npm view openclaw@2026.8.1-beta.1 version dist.tarball dist.integrity --json \
+  > "$evidence_root/openclaw-2026.8.1-beta.1-package.json"
 
 env -i \
   HOME="$seed_home" \
@@ -120,7 +120,7 @@ env -i \
     --omit=dev \
     --no-save \
     --package-lock=false \
-    openclaw@2026.8.1 \
+    openclaw@2026.8.1-beta.1 \
   > "$evidence_root/stable-fixture-install.log" 2>&1
 
 seed_database="$seed_state/state/openclaw.sqlite"
