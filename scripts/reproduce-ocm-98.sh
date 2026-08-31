@@ -284,7 +284,7 @@ run_lane() {
 }
 
 run_lane v0.2.32 "$legacy_ocm" source
-run_lane current-main "$current_ocm" source
+run_lane current-main "$current_ocm" control
 run_lane explicit-path-control "$current_ocm" control
 
 printf 'OCM #98 clean-room reproduction completed.\n' > "$evidence_root/complete.txt"
