@@ -27,6 +27,12 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      - name: Run runtime-install isolation regression
+        run: >-
+          cargo test --locked --test runtime_command_tests
+          official_runtime_install_isolates_npm_lifecycle_from_caller_openclaw_state
+          -- --exact
+
       - name: Build current OCM
         run: cargo build --release --locked --target-dir "$RUNNER_TEMP/target-current"
 
