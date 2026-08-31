@@ -2105,8 +2105,7 @@ fn official_runtime_install_isolates_npm_lifecycle_from_caller_openclaw_state() 
         let cwd = root.child("workspace");
         fs::create_dir_all(&cwd).unwrap();
 
-        let tarball =
-            openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n");
+        let tarball = openclaw_package_tarball("#!/usr/bin/env node\nconsole.log('stable');\n");
         let integrity = sha512_integrity(&tarball);
         let tarball_server = TestHttpServer::serve_bytes(
             "/openclaw-2026.3.24.tgz",
@@ -2122,8 +2121,8 @@ fn official_runtime_install_isolates_npm_lifecycle_from_caller_openclaw_state() 
             TestHttpServer::serve_bytes("/openclaw", "application/json", packument.as_bytes());
         let mut env = ocm_env(&root);
         install_fake_node_and_npm(&root, &mut env, "22.22.3");
-        let _managed_node_server = managed_node
-            .then(|| install_fake_managed_node_archive(&root, &mut env, "24.15.0"));
+        let _managed_node_server =
+            managed_node.then(|| install_fake_managed_node_archive(&root, &mut env, "24.15.0"));
         if managed_node {
             env.insert(
                 "OCM_INTERNAL_NPM_BIN".to_string(),
@@ -2134,8 +2133,7 @@ fn official_runtime_install_isolates_npm_lifecycle_from_caller_openclaw_state() 
             "OCM_INTERNAL_OPENCLAW_RELEASES_URL".to_string(),
             packument_server.url(),
         );
-        let (source_state, source_config, probe_log) =
-            install_npm_lifecycle_probe(&root, &mut env);
+        let (source_state, source_config, probe_log) = install_npm_lifecycle_probe(&root, &mut env);
         let state_before = fs::read(&source_state).unwrap();
         let config_before = fs::read(&source_config).unwrap();
 
@@ -2146,7 +2144,10 @@ fn official_runtime_install_isolates_npm_lifecycle_from_caller_openclaw_state() 
         );
 
         assert!(install.status.success(), "{case}: {}", stderr(&install));
-        assert!(probe_log.is_file(), "{case}: npm lifecycle probe did not run");
+        assert!(
+            probe_log.is_file(),
+            "{case}: npm lifecycle probe did not run"
+        );
         assert_eq!(
             fs::read(&source_state).unwrap(),
             state_before,
