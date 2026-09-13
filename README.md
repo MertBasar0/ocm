@@ -456,6 +456,10 @@ payloads under the legacy, extension, npm, and Git install roots. Clone and
 import still clear live sessions, logs, backups, and process residue so the new
 environment does not share active runtime state with its source.
 
+Cloned plugin registrations use the clone's managed files. Copied local projects
+and archives retain their original source information, and missing managed
+payloads retain clone-owned records for independent diagnosis or repair.
+
 Clone, import, and migration give the target environment a new local gateway and MCP app sandbox listener. They do not copy a public `mcp.apps.sandboxOrigin` because that URL belongs to the source environment's external routing and may still reach the source sandbox. Direct connections derive the target sandbox port automatically. For a target behind a reverse proxy or tunnel, pass its dedicated public origin explicitly:
 
 ```bash

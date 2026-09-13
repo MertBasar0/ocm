@@ -568,6 +568,14 @@ Clone copies the workspace and env config into a new environment, gives the clon
 ocm start rowan
 ```
 
+Registered managed plugins use the clone's installed files. Local project and
+archive paths can remain as source information once the installed payload's
+location is proved to belong to the clone. Missing managed payloads stay missing,
+with their install records rebased onto the target for diagnosis or repair.
+Active plugin paths and copied databases must remain inside the cloned environment;
+locations that escape through external paths or symlinks are rejected before publication. The
+same plugin isolation applies to upgrade simulation clones.
+
 ### Upgrade checkpoint scope
 
 By default, upgrade and rollback safety checkpoints cover the full environment.
