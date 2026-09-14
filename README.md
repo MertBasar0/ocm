@@ -311,6 +311,11 @@ operations reject that runtime. Use `ocm upgrade <env>` so the environment gets
 the snapshot, OpenClaw migration, rollback, and verification path, or clear the
 binding first when intentionally managing an unused runtime.
 
+Runtime package and companion installation preserves the caller's npm settings,
+including script policy and home-relative configuration. OpenClaw lifecycle
+state uses a disposable directory, and inherited service state paths are cleared
+so installation cannot discover the caller's OpenClaw state through those paths.
+
 For unreleased OpenClaw workspaces, `runtime build-local` follows the complete
 transitive closure of private `workspace:*` packages. It rewrites nested
 workspace specs only inside scratch archives before installation; the source

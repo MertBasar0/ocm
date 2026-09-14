@@ -124,10 +124,13 @@ printf '%s\n' \
   OCM_ACTIVE_ENV \
   OCM_ACTIVE_ENV_ROOT \
   OPENCLAW_PROFILE \
+  STATE_DIRECTORY \
+  TMPDIR \
   > "$evidence_root/environment-variable-names.txt"
 
 {
-  printf 'fixtureRoot=<FIXTURE_ROOT>\n'
+  printf 'evidenceRoot=<EVIDENCE_ROOT>\n'
+  printf 'fixtureRoot=<EVIDENCE_ROOT>/fixture\n'
   printf 'sourceState=<FIXTURE_ROOT>/seed-home/.openclaw\n'
   printf 'agents.defaults.workspace=<FIXTURE_ROOT>/seed-home/.openclaw/workspace\n'
   printf 'agents.list[main].workspace=<FIXTURE_ROOT>/seed-home/.openclaw/workspace\n'
@@ -146,7 +149,7 @@ printf '%s\n' \
 env -i \
   HOME="$seed_home" \
   PATH="$PATH" \
-  OPENCLAW_HOME="$seed_state" \
+  OPENCLAW_HOME="$seed_home" \
   OPENCLAW_STATE_DIR="$seed_state" \
   OPENCLAW_CONFIG_PATH="$seed_state/openclaw.json" \
   npm_config_cache="$npm_cache" \
@@ -156,7 +159,7 @@ env -i \
 env -i \
   HOME="$seed_home" \
   PATH="$PATH" \
-  OPENCLAW_HOME="$seed_state" \
+  OPENCLAW_HOME="$seed_home" \
   OPENCLAW_STATE_DIR="$seed_state" \
   OPENCLAW_CONFIG_PATH="$seed_state/openclaw.json" \
   npm_config_cache="$npm_cache" \
@@ -167,7 +170,7 @@ stable_prefix="$fixture_root/stable-prefix"
 env -i \
   HOME="$seed_home" \
   PATH="$PATH" \
-  OPENCLAW_HOME="$seed_state" \
+  OPENCLAW_HOME="$seed_home" \
   OPENCLAW_STATE_DIR="$seed_state" \
   OPENCLAW_CONFIG_PATH="$seed_state/openclaw.json" \
   npm_config_cache="$npm_cache" \
@@ -190,15 +193,10 @@ if [ "$seed_version" != "6" ]; then
   echo "expected the beta.1 fixture to use schema 6; got $seed_version" >&2
   exit 1
 fi
-node "$db_meta_script" "$seed_database" retireCommitmentsV7 \
-  > "$evidence_root/seed-schema7-migration.txt"
+# Keep the package-created schema intact. This is a native schema-6 migration
+# comparison, not an attempted reconstruction of the historical schema-7 home.
 write_fixture_config
 node "$db_meta_script" "$seed_database" > "$evidence_root/seed-before.json"
-seed_version=$(node "$db_meta_script" "$seed_database" userVersion)
-if [ "$seed_version" != "7" ]; then
-  echo "canonical commitments retirement did not produce schema 7; got $seed_version" >&2
-  exit 1
-fi
 
 run_lane() {
   lane_name=$1
@@ -212,7 +210,11 @@ run_lane() {
   lane_config="$lane_state/openclaw.json"
   lane_ocm_home="$lane_root/ocm"
   lane_tmp="$lane_root/tmp"
+  lane_service_state="$lane_root/source-service-state"
+  lane_service_marker="$lane_service_state/plugin-runtime-deps/sentinel"
   mkdir -p "$lane_home" "$lane_ocm_home" "$lane_tmp"
+  mkdir -p "$(dirname "$lane_service_marker")"
+  printf 'caller service state\n' > "$lane_service_marker"
   cp -a "$seed_home/." "$lane_home/"
 
   node "$db_meta_script" "$lane_database" > "$lane_root/before.json"
@@ -220,36 +222,40 @@ run_lane() {
   sha256sum "$lane_config" > "$lane_root/before-config.sha256"
   before_hash=$(cut -d ' ' -f 1 "$lane_root/before.sha256")
   before_config_hash=$(cut -d ' ' -f 1 "$lane_root/before-config.sha256")
+  before_service_hash=$(sha256sum "$lane_service_marker" | cut -d ' ' -f 1)
   before_version=$(node "$db_meta_script" "$lane_database" userVersion)
-  if [ "$before_version" != "7" ]; then
-    echo "$lane_name did not start at schema 7" >&2
+  if [ "$before_version" != "6" ]; then
+    echo "$lane_name did not start at the package-created schema 6" >&2
     exit 1
   fi
 
   if [ "$environment_mode" = "caller" ]; then
-    printf 'env -i HOME=<FIXTURE_ROOT>/%s/home OCM_HOME=<FIXTURE_ROOT>/%s/ocm PATH=<NODE_AND_OCM_PATH> ocm runtime install --version 2026.8.1-beta.2 --json\n' \
-      "$lane_name" "$lane_name" > "$lane_root/command.txt"
+    printf 'env -i HOME=<EVIDENCE_ROOT>/%s/home OCM_HOME=<EVIDENCE_ROOT>/%s/ocm TMPDIR=<EVIDENCE_ROOT>/%s/tmp PATH=<NODE_AND_OCM_PATH> STATE_DIRECTORY=<EVIDENCE_ROOT>/%s/source-service-state <SELECTED_OCM> runtime install --version 2026.8.1-beta.2 --json\n' \
+      "$lane_name" "$lane_name" "$lane_name" "$lane_name" > "$lane_root/command.txt"
     env -i \
       HOME="$lane_home" \
       OCM_HOME="$lane_ocm_home" \
       TMPDIR="$lane_tmp" \
       PATH="$PATH" \
+      STATE_DIRECTORY="$lane_service_state" \
       "$ocm_binary" runtime install --version 2026.8.1-beta.2 --json \
       > "$lane_root/ocm.stdout.json" 2> "$lane_root/ocm.stderr.txt"
   elif [ "$environment_mode" = "explicit" ]; then
-    postinstall_state="$lane_root/postinstall-state"
+    postinstall_home="$lane_root/postinstall-home"
+    postinstall_state="$postinstall_home/.openclaw"
     mkdir -p "$postinstall_state"
-    printf 'env -i HOME=<FIXTURE_ROOT>/%s/home OCM_HOME=<FIXTURE_ROOT>/%s/ocm PATH=<NODE_AND_OCM_PATH> OPENCLAW_HOME=<FIXTURE_ROOT>/%s/postinstall-state OPENCLAW_STATE_DIR=<FIXTURE_ROOT>/%s/postinstall-state OPENCLAW_CONFIG_PATH=<FIXTURE_ROOT>/%s/postinstall-state/openclaw.json ocm runtime install --version 2026.8.1-beta.2 --json\n' \
-      "$lane_name" "$lane_name" "$lane_name" "$lane_name" "$lane_name" \
+    printf 'env -i HOME=<EVIDENCE_ROOT>/%s/home OCM_HOME=<EVIDENCE_ROOT>/%s/ocm TMPDIR=<EVIDENCE_ROOT>/%s/tmp PATH=<NODE_AND_OCM_PATH> OPENCLAW_HOME=<EVIDENCE_ROOT>/%s/postinstall-home OPENCLAW_STATE_DIR=<EVIDENCE_ROOT>/%s/postinstall-home/.openclaw OPENCLAW_CONFIG_PATH=<EVIDENCE_ROOT>/%s/postinstall-home/.openclaw/openclaw.json STATE_DIRECTORY=<EVIDENCE_ROOT>/%s/postinstall-home/.openclaw <SELECTED_OCM> runtime install --version 2026.8.1-beta.2 --json\n' \
+      "$lane_name" "$lane_name" "$lane_name" "$lane_name" "$lane_name" "$lane_name" "$lane_name" \
       > "$lane_root/command.txt"
     env -i \
       HOME="$lane_home" \
       OCM_HOME="$lane_ocm_home" \
       TMPDIR="$lane_tmp" \
       PATH="$PATH" \
-      OPENCLAW_HOME="$postinstall_state" \
+      OPENCLAW_HOME="$postinstall_home" \
       OPENCLAW_STATE_DIR="$postinstall_state" \
       OPENCLAW_CONFIG_PATH="$postinstall_state/openclaw.json" \
+      STATE_DIRECTORY="$postinstall_state" \
       "$ocm_binary" runtime install --version 2026.8.1-beta.2 --json \
       > "$lane_root/ocm.stdout.json" 2> "$lane_root/ocm.stderr.txt"
   else
@@ -263,23 +269,29 @@ run_lane() {
   after_hash=$(cut -d ' ' -f 1 "$lane_root/after.sha256")
   after_config_hash=$(cut -d ' ' -f 1 "$lane_root/after-config.sha256")
   after_version=$(node "$db_meta_script" "$lane_database" userVersion)
+  after_service_hash=missing
+  if [ -f "$lane_service_marker" ]; then
+    after_service_hash=$(sha256sum "$lane_service_marker" | cut -d ' ' -f 1)
+  fi
 
   if [ "$expected_change" = "source" ]; then
-    if [ "$after_version" != "8" ] || [ "$before_hash" = "$after_hash" ]; then
+    if [ "$after_version" != "8" ] || [ "$before_hash" = "$after_hash" ] || \
+      [ "$before_service_hash" = "$after_service_hash" ]; then
       echo "$lane_name did not reproduce the source mutation" >&2
       exit 1
     fi
     result="reproduced-source-mutation"
   else
-    if [ "$after_version" != "7" ] || [ "$before_hash" != "$after_hash" ] || \
-      [ "$before_config_hash" != "$after_config_hash" ]; then
+    if [ "$after_version" != "6" ] || [ "$before_hash" != "$after_hash" ] || \
+      [ "$before_config_hash" != "$after_config_hash" ] || \
+      [ "$before_service_hash" != "$after_service_hash" ]; then
       echo "$lane_name control source changed unexpectedly" >&2
       exit 1
     fi
     result="source-unchanged"
   fi
 
-  printf '{\n  "lane": "%s",\n  "environmentMode": "%s",\n  "expectedChange": "%s",\n  "result": "%s",\n  "beforeVersion": %s,\n  "afterVersion": %s,\n  "sourceHashChanged": %s,\n  "sourceConfigHashChanged": %s\n}\n' \
+  printf '{\n  "lane": "%s",\n  "environmentMode": "%s",\n  "expectedChange": "%s",\n  "result": "%s",\n  "beforeVersion": %s,\n  "afterVersion": %s,\n  "sourceHashChanged": %s,\n  "sourceConfigHashChanged": %s,\n  "sourceServiceStateChanged": %s\n}\n' \
     "$lane_name" \
     "$environment_mode" \
     "$expected_change" \
@@ -288,11 +300,12 @@ run_lane() {
     "$after_version" \
     "$([ "$before_hash" = "$after_hash" ] && printf false || printf true)" \
     "$([ "$before_config_hash" = "$after_config_hash" ] && printf false || printf true)" \
+    "$([ "$before_service_hash" = "$after_service_hash" ] && printf false || printf true)" \
     > "$lane_root/result.json"
 }
 
 run_lane v0.2.32 "$legacy_ocm" caller source
-run_lane current-main "$current_ocm" caller unchanged
-run_lane explicit-path-control "$current_ocm" explicit unchanged
+run_lane fixed-current "$current_ocm" caller unchanged
+run_lane explicit-path-control "$legacy_ocm" explicit unchanged
 
 printf 'OCM #98 clean-room reproduction completed.\n' > "$evidence_root/complete.txt"

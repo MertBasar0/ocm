@@ -73,9 +73,9 @@ jobs:
             ${{ runner.temp }}/ocm98-evidence/v0.2.32/*.txt
             ${{ runner.temp }}/ocm98-evidence/v0.2.32/*.json
             ${{ runner.temp }}/ocm98-evidence/v0.2.32/*.sha256
-            ${{ runner.temp }}/ocm98-evidence/current-main/*.txt
-            ${{ runner.temp }}/ocm98-evidence/current-main/*.json
-            ${{ runner.temp }}/ocm98-evidence/current-main/*.sha256
+            ${{ runner.temp }}/ocm98-evidence/fixed-current/*.txt
+            ${{ runner.temp }}/ocm98-evidence/fixed-current/*.json
+            ${{ runner.temp }}/ocm98-evidence/fixed-current/*.sha256
             ${{ runner.temp }}/ocm98-evidence/explicit-path-control/*.txt
             ${{ runner.temp }}/ocm98-evidence/explicit-path-control/*.json
             ${{ runner.temp }}/ocm98-evidence/explicit-path-control/*.sha256

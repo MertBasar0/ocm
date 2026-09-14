@@ -924,18 +924,16 @@ fn isolate_npm_lifecycle_environment(
     install_root: &Path,
 ) -> Result<PathBuf, String> {
     // Package lifecycle scripts must not discover or migrate caller-owned OpenClaw state.
-    // Keep their home and config disposable for both host and managed npm installs.
+    // Keep npm's caller home/config semantics while giving OpenClaw its own state.
     let lifecycle_root = install_root.join(".ocm-npm-lifecycle");
-    let home = lifecycle_root.join("home");
-    let openclaw_home = home.join(".openclaw");
-    let state_dir = openclaw_home.join("state");
+    let openclaw_home = lifecycle_root.join("home");
+    let state_dir = openclaw_home.join(".openclaw");
     ensure_dir(&state_dir)?;
     command
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
         .env("OPENCLAW_HOME", &openclaw_home)
         .env("OPENCLAW_STATE_DIR", &state_dir)
-        .env("OPENCLAW_CONFIG_PATH", openclaw_home.join("openclaw.json"))
+        .env("OPENCLAW_CONFIG_PATH", state_dir.join("openclaw.json"))
+        .env_remove("STATE_DIRECTORY")
         .env_remove("OCM_ACTIVE_ENV")
         .env_remove("OCM_ACTIVE_ENV_ROOT")
         .env_remove("OPENCLAW_PROFILE");
